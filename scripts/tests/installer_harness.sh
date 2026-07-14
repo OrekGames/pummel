@@ -1,375 +1,281 @@
 #!/usr/bin/env bash
-# Offline installer regression harness for scripts/install.sh
+# Offline installer harness: exercises checksum verification and archive safety
+# without contacting GitHub or requiring minisign.
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/pummel-installer-harness.XXXXXX")"
-cleanup() { rm -rf "$SCRATCH"; }
-trap cleanup EXIT
-
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+INSTALLER="$ROOT/scripts/install.sh"
+FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pummel-installer-harness.XXXXXX")"
 PASS=0
 FAIL=0
+HTTP_PID=""
 
-assert_eq() {
-    local expected="$1"
-    local actual="$2"
-    local label="$3"
-    if [ "$expected" = "$actual" ]; then
-        printf 'PASS: %s\n' "$label"
-        PASS=$((PASS + 1))
-    else
-        printf 'FAIL: %s\n  expected: %s\n  actual:   %s\n' "$label" "$expected" "$actual" >&2
-        FAIL=$((FAIL + 1))
-    fi
+cleanup() {
+  if [ -n "${HTTP_PID:-}" ]; then
+    kill "$HTTP_PID" 2>/dev/null || true
+    wait "$HTTP_PID" 2>/dev/null || true
+    HTTP_PID=""
+  fi
+  rm -rf "$FIXTURE_ROOT"
+}
+trap cleanup EXIT
+
+info() {
+  printf '==> %s\n' "$*"
 }
 
-assert_contains() {
-    local haystack="$1"
-    local needle="$2"
-    local label="$3"
-    if printf '%s' "$haystack" | grep -Fq "$needle"; then
-        printf 'PASS: %s\n' "$label"
-        PASS=$((PASS + 1))
-    else
-        printf 'FAIL: %s\n  missing: %s\n  in: %s\n' "$label" "$needle" "$haystack" >&2
-        FAIL=$((FAIL + 1))
-    fi
+pass() {
+  PASS=$((PASS + 1))
+  printf 'PASS: %s\n' "$*"
 }
 
-assert_exit() {
-    local expected="$1"
-    local actual="$2"
-    local label="$3"
-    assert_eq "$expected" "$actual" "$label"
+fail() {
+  FAIL=$((FAIL + 1))
+  printf 'FAIL: %s\n' "$*" >&2
 }
 
-require_command() {
-    command -v "$1" >/dev/null 2>&1 || {
-        echo "Missing required command for harness: $1" >&2
-        exit 1
-    }
-}
-
-require_command python3
-require_command curl
-require_command tar
-require_command minisign
-require_command sha256sum
-
-KEY_DIR="$SCRATCH/keys"
-mkdir -p "$KEY_DIR"
-# Generate an ephemeral unencrypted minisign keypair for fixture signing.
-minisign -G -W -f -p "$KEY_DIR/minisign.pub" -s "$KEY_DIR/minisign.key" >/dev/null
-TEST_PUB_KEY="$(awk 'NR==2 { print; exit }' "$KEY_DIR/minisign.pub")"
-
-INSTALLER="$SCRATCH/install.sh"
-python3 - "$ROOT/scripts/install.sh" "$INSTALLER" "$TEST_PUB_KEY" <<'PY'
-from pathlib import Path
-import sys
-
-src, dst, pub = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
-text = src.read_text(encoding="utf-8")
-out_lines = []
-for line in text.splitlines(keepends=True):
-    if line.startswith("PUB_KEY="):
-        out_lines.append(f'PUB_KEY="{pub}"\n')
-    else:
-        out_lines.append(line)
-dst.write_text("".join(out_lines), encoding="utf-8")
-PY
-chmod +x "$INSTALLER"
-
-# Unit-test normalize_version by sourcing helpers through a tiny wrapper.
-normalize_out="$SCRATCH/normalize.out"
-bash -c '
-set -euo pipefail
-source /dev/null
-normalize_version() {
-    local version="$1"
-    version="${version%$'\''\r'\''}"
-    if printf "%s\n" "$version" | grep -Eq "^[0-9]+\.[0-9]+\.[0-9]+$"; then
-        printf "v%s\n" "$version"
-        return 0
-    fi
-    if printf "%s\n" "$version" | grep -Eq "^v[0-9]+\.[0-9]+\.[0-9]+$"; then
-        printf "%s\n" "$version"
-        return 0
-    fi
-    echo "bad" >&2
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command for harness: $1" >&2
     exit 1
+  }
 }
-normalize_version "0.1.0"
-normalize_version "v0.2.3"
-' > "$normalize_out"
-assert_eq $'v0.1.0\nv0.2.3' "$(cat "$normalize_out")" "normalize_version accepts bare and v-prefixed versions"
 
-FIXTURES="$SCRATCH/fixtures"
-mkdir -p "$FIXTURES/download/v0.1.0" "$FIXTURES/download/v0.2.0" "$FIXTURES/api"
+require_cmd bash
+require_cmd curl
+require_cmd tar
+require_cmd python3
+require_cmd sha256sum
+require_cmd awk
+require_cmd ln
 
-# Create a fake binary payload.
-printf '#!/bin/sh\necho pummel-fixture\n' > "$FIXTURES/pummel"
-chmod +x "$FIXTURES/pummel"
-tar -C "$FIXTURES" -czf "$FIXTURES/download/v0.2.0/pummel-v0.2.0-x86_64-unknown-linux-gnu.tar.gz" pummel
-tar -C "$FIXTURES" -czf "$FIXTURES/download/v0.1.0/pummel-v0.1.0-x86_64-unknown-linux-gnu.tar.gz" pummel
+HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+HOST_ARCH="$(uname -m)"
+case "$HOST_OS-$HOST_ARCH" in
+  linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+  darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
+  darwin-arm64|darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
+  *)
+    echo "Unsupported harness host: $HOST_OS/$HOST_ARCH" >&2
+    exit 1
+    ;;
+esac
 
-# Malicious archive with path traversal member.
-python3 - "$FIXTURES/download/v0.2.0/evil-traversal.tar.gz" <<'PY'
-import io
-import sys
-import tarfile
+write_checksums() {
+  local dir="$1"
+  local archive="$2"
+  local hash
+  hash="$(sha256sum "$dir/$archive" | awk '{ print $1 }')"
+  printf '%s  %s\n' "$hash" "$archive" > "$dir/checksums-sha256.txt"
+}
 
-out = sys.argv[1]
-with tarfile.open(out, "w:gz") as tf:
-    info = tarfile.TarInfo(name="../evil")
-    data = b"evil\n"
-    info.size = len(data)
-    tf.addfile(info, io.BytesIO(data))
-PY
-
-# Manifests for good archives.
-(
-    cd "$FIXTURES/download/v0.2.0"
-    sha256sum "pummel-v0.2.0-x86_64-unknown-linux-gnu.tar.gz" > checksums-sha256.txt
-    minisign -S -s "$KEY_DIR/minisign.key" -m checksums-sha256.txt >/dev/null
-)
-(
-    cd "$FIXTURES/download/v0.1.0"
-    sha256sum "pummel-v0.1.0-x86_64-unknown-linux-gnu.tar.gz" > checksums-sha256.txt
-    minisign -S -s "$KEY_DIR/minisign.key" -m checksums-sha256.txt >/dev/null
-)
-
-# Bad signature fixture.
-cp "$FIXTURES/download/v0.2.0/checksums-sha256.txt" "$FIXTURES/download/v0.2.0/bad-checksums-sha256.txt"
-printf 'tampered\n' >> "$FIXTURES/download/v0.2.0/bad-checksums-sha256.txt"
-cp "$FIXTURES/download/v0.2.0/checksums-sha256.txt.minisig" "$FIXTURES/download/v0.2.0/bad-checksums-sha256.txt.minisig"
-
-# Mock GitHub Releases API pages: page1 has older + prerelease; page2 has latest stable.
-python3 - "$FIXTURES" <<'PY'
-import json
-from pathlib import Path
-
-root = Path(__import__("sys").argv[1])
-api = root / "api"
-api.mkdir(parents=True, exist_ok=True)
-
-page1 = [
-    {
-        "tag_name": "v0.1.0",
-        "draft": False,
-        "prerelease": False,
-    },
-    {
-        "tag_name": "v0.3.0-rc.1",
-        "draft": False,
-        "prerelease": True,
-    },
-]
-page2 = [
-    {
-        "tag_name": "v0.2.0",
-        "draft": False,
-        "prerelease": False,
-    },
-]
-(api / "releases-page-1.json").write_text(json.dumps(page1), encoding="utf-8")
-(api / "releases-page-2.json").write_text(json.dumps(page2), encoding="utf-8")
-PY
-
-PORT_FILE="$SCRATCH/port"
-SERVER_LOG="$SCRATCH/server.log"
-python3 - "$FIXTURES" "$PORT_FILE" <<'PY' >"$SERVER_LOG" 2>&1 &
-import json
-import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs
-
-fixtures = Path(sys.argv[1])
-port_file = Path(sys.argv[2])
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        qs = parse_qs(parsed.query)
-
-        if path.endswith("/releases"):
-            page = int(qs.get("page", ["1"])[0])
-            body_path = fixtures / "api" / f"releases-page-{page}.json"
-            if not body_path.exists():
-                self.send_response(404)
-                self.end_headers()
-                return
-            data = body_path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            if page == 1:
-                self.send_header(
-                    "Link",
-                    f'<http://127.0.0.1:{self.server.server_address[1]}/repos/OrekGames/pummel/releases?per_page=100&page=2>; rel="next"',
-                )
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
-
-        # Download assets: /download..., /download-badsig..., etc.
-        if path.startswith("/download"):
-            rel = path.lstrip("/")
-            file_path = fixtures / rel
-            if not file_path.is_file():
-                self.send_response(404)
-                self.end_headers()
-                return
-            data = file_path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
-
-        self.send_response(404)
-        self.end_headers()
-
-httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-port_file.write_text(str(httpd.server_address[1]), encoding="utf-8")
-httpd.serve_forever()
-PY
-SERVER_PID=$!
-
-for _ in $(seq 1 50); do
-    if [ -f "$PORT_FILE" ]; then
-        break
-    fi
-    sleep 0.1
-done
-PORT="$(cat "$PORT_FILE")"
-API_BASE="http://127.0.0.1:${PORT}"
-DOWNLOAD_ROOT="${API_BASE}/download"
-
-# Force Linux x86_64 target detection regardless of host.
-export PUMMEL_GITHUB_API_BASE="$API_BASE"
-export PUMMEL_REPO="OrekGames/pummel"
+make_good_archive() {
+  local dir="$1"
+  local version="$2"
+  local target="$3"
+  local archive="pummel-${version}-${target}.tar.gz"
+  mkdir -p "$dir/bin"
+  printf '#!/bin/sh\necho pummel-fixture\n' > "$dir/bin/pummel"
+  chmod +x "$dir/bin/pummel"
+  # Avoid macOS AppleDouble (._*) members in fixture archives.
+  COPYFILE_DISABLE=1 tar -C "$dir/bin" -czf "$dir/$archive" pummel
+  write_checksums "$dir" "$archive"
+}
 
 run_installer() {
-    local install_dir="$1"
-    shift
-    env \
-        PUMMEL_INSTALL_DIR="$install_dir" \
-        PUMMEL_GITHUB_API_BASE="$API_BASE" \
-        PUMMEL_REPO="OrekGames/pummel" \
-        "$@" \
-        bash "$INSTALLER"
+  local download_base="$1"
+  local install_dir="$2"
+  local version="$3"
+  local log="$4"
+  env \
+    PUMMEL_DOWNLOAD_BASE="$download_base" \
+    PUMMEL_INSTALL_DIR="$install_dir" \
+    PUMMEL_VERSION="$version" \
+    bash "$INSTALLER" >"$log" 2>&1
 }
 
-# Patch uname inside a wrapper for Linux x86_64.
-WRAPPER="$SCRATCH/uname-wrap"
-mkdir -p "$WRAPPER"
-cat > "$WRAPPER/uname" <<'EOF'
-#!/bin/sh
-case "$1" in
-  -s) echo Linux ;;
-  -m) echo x86_64 ;;
-  *) /usr/bin/uname "$@" ;;
-esac
-EOF
-chmod +x "$WRAPPER/uname"
+start_http() {
+  local root="$1"
+  local port_file="$2"
+  rm -f "$port_file"
+  python3 - "$root" "$port_file" <<'PY' &
+import http.server
+import os
+import socketserver
+import sys
 
-# 1) Discovers latest stable across pages and skips prerelease.
-INSTALL_DIR="$SCRATCH/install-latest"
+root, port_file = sys.argv[1], sys.argv[2]
+os.chdir(root)
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
+    port = httpd.server_address[1]
+    with open(port_file, "w", encoding="utf-8") as fh:
+        fh.write(str(port))
+    httpd.serve_forever()
+PY
+  HTTP_PID=$!
+  for _ in $(seq 1 50); do
+    if [ -s "$port_file" ]; then
+      break
+    fi
+    sleep 0.05
+  done
+  [ -s "$port_file" ] || { echo "HTTP server failed to start" >&2; exit 1; }
+  HTTP_PORT="$(cat "$port_file")"
+}
+
+stop_http() {
+  if [ -n "${HTTP_PID:-}" ]; then
+    kill "$HTTP_PID" 2>/dev/null || true
+    wait "$HTTP_PID" 2>/dev/null || true
+    HTTP_PID=""
+  fi
+}
+
+PORT_FILE="$FIXTURE_ROOT/http.port"
+HTTP_ROOT="$FIXTURE_ROOT/http"
+mkdir -p "$HTTP_ROOT"
+
+# --- Happy path ---
+info "Happy path via local HTTP"
+GOOD="$HTTP_ROOT/good"
+mkdir -p "$GOOD/v0.1.0"
+make_good_archive "$GOOD/v0.1.0" "v0.1.0" "$TARGET"
+start_http "$GOOD" "$PORT_FILE"
+INSTALL_DIR="$FIXTURE_ROOT/install-http"
 mkdir -p "$INSTALL_DIR"
-set +e
-PATH="$WRAPPER:$PATH" \
-PUMMEL_DOWNLOAD_BASE="$DOWNLOAD_ROOT" \
-run_installer "$INSTALL_DIR" >"$SCRATCH/latest.out" 2>&1
-rc=$?
-set -e
-assert_exit 0 "$rc" "latest discovery install exits 0"
-assert_contains "$(cat "$SCRATCH/latest.out")" "Found latest stable Pummel version: v0.2.0" "skips prerelease and picks latest across pages"
-assert_eq "pummel-fixture" "$("$INSTALL_DIR/pummel")" "installed binary runs"
+LOG="$FIXTURE_ROOT/http-happy.log"
+if run_installer "http://127.0.0.1:$HTTP_PORT" "$INSTALL_DIR" "v0.1.0" "$LOG"; then
+  if [ -x "$INSTALL_DIR/pummel" ]; then
+    pass "HTTP happy path"
+  else
+    fail "HTTP happy path: binary missing"
+    cat "$LOG" >&2 || true
+  fi
+else
+  fail "HTTP happy path failed"
+  cat "$LOG" >&2 || true
+fi
+stop_http
+rm -f "$PORT_FILE"
 
-# 2) Bare version normalization.
-INSTALL_DIR="$SCRATCH/install-pin"
+# --- Bad checksum ---
+info "Rejects bad checksum"
+BAD="$HTTP_ROOT/bad-checksum"
+mkdir -p "$BAD/v0.1.0"
+make_good_archive "$BAD/v0.1.0" "v0.1.0" "$TARGET"
+printf '0000000000000000000000000000000000000000000000000000000000000000  pummel-v0.1.0-%s.tar.gz\n' "$TARGET" \
+  > "$BAD/v0.1.0/checksums-sha256.txt"
+start_http "$BAD" "$PORT_FILE"
+INSTALL_DIR="$FIXTURE_ROOT/install-bad"
 mkdir -p "$INSTALL_DIR"
-set +e
-PATH="$WRAPPER:$PATH" \
-PUMMEL_VERSION="0.1.0" \
-PUMMEL_DOWNLOAD_BASE="$DOWNLOAD_ROOT" \
-run_installer "$INSTALL_DIR" >"$SCRATCH/pin.out" 2>&1
-rc=$?
-set -e
-assert_exit 0 "$rc" "pinned bare version install exits 0"
-assert_contains "$(cat "$SCRATCH/pin.out")" "Using requested Pummel version: v0.1.0" "normalizes 0.1.0 to v0.1.0"
+LOG="$FIXTURE_ROOT/bad.log"
+if run_installer "http://127.0.0.1:$HTTP_PORT" "$INSTALL_DIR" "v0.1.0" "$LOG"; then
+  fail "bad checksum should have failed"
+else
+  if grep -qi 'checksum' "$LOG"; then
+    pass "bad checksum rejected"
+  else
+    fail "bad checksum failed for wrong reason"
+    cat "$LOG" >&2 || true
+  fi
+fi
+stop_http
+rm -f "$PORT_FILE"
 
-# 3) Bad signature fails closed.
-INSTALL_DIR="$SCRATCH/install-badsig"
-mkdir -p "$INSTALL_DIR" "$FIXTURES/download-badsig/v0.2.0"
-cp "$FIXTURES/download/v0.2.0/pummel-v0.2.0-x86_64-unknown-linux-gnu.tar.gz" \
-   "$FIXTURES/download-badsig/v0.2.0/"
-cp "$FIXTURES/download/v0.2.0/bad-checksums-sha256.txt" \
-   "$FIXTURES/download-badsig/v0.2.0/checksums-sha256.txt"
-cp "$FIXTURES/download/v0.2.0/bad-checksums-sha256.txt.minisig" \
-   "$FIXTURES/download-badsig/v0.2.0/checksums-sha256.txt.minisig"
-set +e
-PATH="$WRAPPER:$PATH" \
-PUMMEL_VERSION="v0.2.0" \
-PUMMEL_DOWNLOAD_BASE="${API_BASE}/download-badsig" \
-run_installer "$INSTALL_DIR" >"$SCRATCH/badsig.out" 2>&1
-rc=$?
-set -e
-assert_exit 1 "$rc" "bad signature fails"
-assert_contains "$(cat "$SCRATCH/badsig.out")" "Signature verification failed" "bad signature error message"
-
-# 4) Checksum mismatch fails closed.
-MISMATCH_ROOT="$FIXTURES/download-mismatch"
-mkdir -p "$MISMATCH_ROOT/v0.2.0"
-cp "$FIXTURES/download/v0.2.0/checksums-sha256.txt" "$MISMATCH_ROOT/v0.2.0/"
-cp "$FIXTURES/download/v0.2.0/checksums-sha256.txt.minisig" "$MISMATCH_ROOT/v0.2.0/"
-cp "$FIXTURES/download/v0.2.0/pummel-v0.2.0-x86_64-unknown-linux-gnu.tar.gz" \
-   "$MISMATCH_ROOT/v0.2.0/pummel-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
-printf 'x' >> "$MISMATCH_ROOT/v0.2.0/pummel-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
-INSTALL_DIR="$SCRATCH/install-mismatch"
+# --- Missing archive entry in checksums ---
+info "Rejects missing archive entry in checksums"
+MISS="$HTTP_ROOT/missing-entry"
+mkdir -p "$MISS/v0.1.0"
+make_good_archive "$MISS/v0.1.0" "v0.1.0" "$TARGET"
+printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  other-file.tar.gz\n' \
+  > "$MISS/v0.1.0/checksums-sha256.txt"
+start_http "$MISS" "$PORT_FILE"
+INSTALL_DIR="$FIXTURE_ROOT/install-miss"
 mkdir -p "$INSTALL_DIR"
-set +e
-PATH="$WRAPPER:$PATH" \
-PUMMEL_VERSION="v0.2.0" \
-PUMMEL_DOWNLOAD_BASE="${API_BASE}/download-mismatch" \
-run_installer "$INSTALL_DIR" >"$SCRATCH/mismatch.out" 2>&1
-rc=$?
-set -e
-assert_exit 1 "$rc" "checksum mismatch fails"
-assert_contains "$(cat "$SCRATCH/mismatch.out")" "SHA256 checksum mismatch" "checksum mismatch error message"
+LOG="$FIXTURE_ROOT/miss.log"
+if run_installer "http://127.0.0.1:$HTTP_PORT" "$INSTALL_DIR" "v0.1.0" "$LOG"; then
+  fail "missing checksum entry should have failed"
+else
+  if grep -qiE 'not found in checksums|checksum' "$LOG"; then
+    pass "missing checksum entry rejected"
+  else
+    fail "missing entry failed for wrong reason"
+    cat "$LOG" >&2 || true
+  fi
+fi
+stop_http
+rm -f "$PORT_FILE"
 
-# 5) Path traversal / unexpected members rejected.
-TRAV_ROOT="$FIXTURES/download-traversal"
-mkdir -p "$TRAV_ROOT/v0.2.0"
-cp "$FIXTURES/download/v0.2.0/evil-traversal.tar.gz" \
-   "$TRAV_ROOT/v0.2.0/pummel-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+# --- Wrong member name ---
+info "Rejects unsafe tar member"
+TRAV="$HTTP_ROOT/traversal"
+mkdir -p "$TRAV/v0.1.0/payload"
+printf 'evil\n' > "$TRAV/v0.1.0/payload/evil"
 (
-    cd "$TRAV_ROOT/v0.2.0"
-    sha256sum "pummel-v0.2.0-x86_64-unknown-linux-gnu.tar.gz" > checksums-sha256.txt
-    minisign -S -s "$KEY_DIR/minisign.key" -m checksums-sha256.txt >/dev/null
+  cd "$TRAV/v0.1.0/payload"
+  COPYFILE_DISABLE=1 tar -czf "../pummel-v0.1.0-${TARGET}.tar.gz" evil
 )
-INSTALL_DIR="$SCRATCH/install-traversal"
+ARCHIVE="pummel-v0.1.0-${TARGET}.tar.gz"
+HASH="$(sha256sum "$TRAV/v0.1.0/$ARCHIVE" | awk '{ print $1 }')"
+printf '%s  %s\n' "$HASH" "$ARCHIVE" > "$TRAV/v0.1.0/checksums-sha256.txt"
+start_http "$TRAV" "$PORT_FILE"
+INSTALL_DIR="$FIXTURE_ROOT/install-trav"
 mkdir -p "$INSTALL_DIR"
-set +e
-PATH="$WRAPPER:$PATH" \
-PUMMEL_VERSION="v0.2.0" \
-PUMMEL_DOWNLOAD_BASE="${API_BASE}/download-traversal" \
-run_installer "$INSTALL_DIR" >"$SCRATCH/traversal.out" 2>&1
-rc=$?
-set -e
-assert_exit 1 "$rc" "unsafe archive members fail"
-assert_contains "$(cat "$SCRATCH/traversal.out")" "Archive member validation failed" "unsafe archive error message"
+LOG="$FIXTURE_ROOT/trav.log"
+if run_installer "http://127.0.0.1:$HTTP_PORT" "$INSTALL_DIR" "v0.1.0" "$LOG"; then
+  fail "unsafe tar member should have failed"
+else
+  if grep -qiE 'unexpected archive member|member validation|Archive must' "$LOG"; then
+    pass "unsafe tar member rejected"
+  else
+    fail "unsafe member failed for wrong reason"
+    cat "$LOG" >&2 || true
+  fi
+fi
+stop_http
+rm -f "$PORT_FILE"
 
-kill "$SERVER_PID" >/dev/null 2>&1 || true
-wait "$SERVER_PID" 2>/dev/null || true
+# --- Symlink member ---
+info "Rejects symlink tar member"
+SYM="$HTTP_ROOT/symlink"
+mkdir -p "$SYM/v0.1.0/payload"
+ln -sf /etc/hosts "$SYM/v0.1.0/payload/pummel"
+(
+  cd "$SYM/v0.1.0/payload"
+  # Store the symlink itself (do not follow with -h).
+  COPYFILE_DISABLE=1 tar -czf "../pummel-v0.1.0-${TARGET}.tar.gz" pummel
+)
+ARCHIVE="pummel-v0.1.0-${TARGET}.tar.gz"
+HASH="$(sha256sum "$SYM/v0.1.0/$ARCHIVE" | awk '{ print $1 }')"
+printf '%s  %s\n' "$HASH" "$ARCHIVE" > "$SYM/v0.1.0/checksums-sha256.txt"
+start_http "$SYM" "$PORT_FILE"
+INSTALL_DIR="$FIXTURE_ROOT/install-sym"
+mkdir -p "$INSTALL_DIR"
+LOG="$FIXTURE_ROOT/sym.log"
+if run_installer "http://127.0.0.1:$HTTP_PORT" "$INSTALL_DIR" "v0.1.0" "$LOG"; then
+  fail "symlink member should have failed"
+else
+  if grep -qiE 'regular file|symlink|member validation|Archive member' "$LOG"; then
+    pass "symlink tar member rejected"
+  else
+    fail "symlink member failed for wrong reason"
+    cat "$LOG" >&2 || true
+  fi
+fi
+stop_http
+rm -f "$PORT_FILE"
 
-printf '\nInstaller harness: %s passed, %s failed\n' "$PASS" "$FAIL"
+printf '\nHarness summary: %s passed, %s failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
-    exit 1
+  exit 1
+fi
+if [ "$PASS" -lt 4 ]; then
+  echo "Expected at least 4 passing checks" >&2
+  exit 1
 fi

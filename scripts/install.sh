@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 
-# Pummel - Secure Installer for macOS and Linux
-# Discovers the latest stable GitHub Release, verifies the signed checksum
-# manifest with minisign, validates the archive SHA256 checksum, and installs
-# the platform binary.
+# Pummel - Installer for macOS and Linux
+# Discovers the latest stable GitHub Release, verifies the archive SHA256
+# checksum against checksums-sha256.txt, and installs the platform binary.
 
 set -euo pipefail
 
-PUB_KEY="RWQxie7dcHNLULOnZ3qGIGV5IQHhCs5u48Py3qrbCbGUZ3F6PrHyTCrF"
 GITHUB_API_BASE="${PUMMEL_GITHUB_API_BASE:-https://api.github.com}"
 GITHUB_API_BASE="${GITHUB_API_BASE%/}"
 GITHUB_REPO="${PUMMEL_REPO:-OrekGames/pummel}"
@@ -19,7 +17,6 @@ ARCH=""
 TARGET=""
 ARCHIVE_EXT=""
 SCRATCH_DIR=""
-MINISIGN_BIN=""
 SHA256_TOOL=""
 
 info() {
@@ -44,20 +41,6 @@ on_interrupt() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
-}
-
-print_minisign_instructions() {
-    printf '%s\n' "minisign is required to verify Pummel releases before installation." >&2
-    case "$OS" in
-        darwin)
-            printf '%s\n' "Install it on macOS with: brew install minisign" >&2
-            ;;
-        linux)
-            printf '%s\n' "Install it on Debian/Ubuntu with: sudo apt-get install minisign" >&2
-            printf '%s\n' "Install it on Fedora with: sudo dnf install minisign" >&2
-            printf '%s\n' "Install it on Arch with: sudo pacman -S minisign" >&2
-            ;;
-    esac
 }
 
 detect_target() {
@@ -117,14 +100,6 @@ require_prerequisites() {
     require_command grep
     require_command sort
     require_command python3
-
-    if command -v minisign >/dev/null 2>&1; then
-        MINISIGN_BIN="$(command -v minisign)"
-    else
-        print_minisign_instructions
-        fail "Install minisign from a trusted package manager or release source, then rerun this installer"
-    fi
-
     select_sha256_tool
 }
 
@@ -156,7 +131,7 @@ curl_download() {
 
 discover_latest_version() {
     local page=1
-    local body headers next_url versions_file latest link_header
+    local body headers next_url versions_file latest
 
     versions_file="$SCRATCH_DIR/release-versions.txt"
     : > "$versions_file"
@@ -222,16 +197,6 @@ PY
     printf '%s\n' "$latest"
 }
 
-verify_manifest() {
-    local manifest_path="$1"
-    local signature_path="$2"
-
-    info "Verifying signed checksum manifest with minisign"
-    if ! "$MINISIGN_BIN" -V -P "$PUB_KEY" -m "$manifest_path" -x "$signature_path"; then
-        fail "Signature verification failed for checksums-sha256.txt"
-    fi
-}
-
 compute_sha256() {
     local file_path="$1"
 
@@ -258,7 +223,7 @@ verify_checksum() {
     local expected_hash actual_hash
 
     expected_hash="$(awk -v name="$archive_name" '$2 == name { print tolower($1); found=1 } END { if (!found) exit 1 }' "$manifest_path")" || \
-        fail "Archive $archive_name not found in verified checksums-sha256.txt"
+        fail "Archive $archive_name not found in checksums-sha256.txt"
     actual_hash="$(compute_sha256 "$archive_path")"
 
     if [ "$expected_hash" != "$actual_hash" ]; then
@@ -269,36 +234,39 @@ verify_checksum() {
 
 install_binary() {
     local archive_path="$1"
-    local extract_dir binary_path install_dir resolved
+    local extract_dir binary_path install_dir resolved extract_dir_resolved
 
     info "Extracting Pummel binary"
     extract_dir="$SCRATCH_DIR/extract"
     mkdir -p "$extract_dir"
 
-    # Extract only the expected member and reject path traversal / odd names.
-    if ! tar -tzf "$archive_path" | awk '
-        BEGIN { found = 0 }
-        {
-            if ($0 == "pummel") {
-                found += 1
-                next
-            }
-            print "Unexpected or unsafe archive member: " $0 > "/dev/stderr"
-            exit 2
-        }
-        END {
-            if (found != 1) {
-                print "Archive must contain exactly one root-level pummel binary" > "/dev/stderr"
-                exit 1
-            }
-        }
-    '; then
+    # Require exactly one regular-file member named pummel (reject symlinks etc.).
+    if ! python3 - "$archive_path" <<'PY'
+import sys
+import tarfile
+
+archive = sys.argv[1]
+with tarfile.open(archive, "r:gz") as tf:
+    members = tf.getmembers()
+    if len(members) != 1:
+        print(f"Archive must contain exactly one member; found {len(members)}", file=sys.stderr)
+        sys.exit(1)
+    member = members[0]
+    if member.name != "pummel":
+        print(f"Unexpected archive member: {member.name}", file=sys.stderr)
+        sys.exit(1)
+    if not member.isfile() or member.issym() or member.islnk():
+        print(f"Archive member must be a regular file, not {member.type}", file=sys.stderr)
+        sys.exit(1)
+PY
+    then
         fail "Archive member validation failed"
     fi
 
     tar -xzf "$archive_path" -C "$extract_dir" pummel
     binary_path="$extract_dir/pummel"
     [ -f "$binary_path" ] || fail "Extracted archive did not contain a pummel binary"
+    [ ! -L "$binary_path" ] || fail "Refusing to install a symlink binary"
     extract_dir_resolved="$(cd "$extract_dir" && pwd)"
     resolved="$(cd "$(dirname "$binary_path")" && pwd)/$(basename "$binary_path")"
     case "$resolved" in
@@ -326,7 +294,7 @@ install_binary() {
 }
 
 main() {
-    local version download_base manifest_path signature_path archive_name archive_path
+    local version download_base manifest_path archive_name archive_path
 
     detect_target
 
@@ -346,21 +314,18 @@ main() {
     fi
 
     if [ -n "${PUMMEL_DOWNLOAD_BASE:-}" ]; then
-        # Test/override root; the selected version directory is appended.
+        # Override root URL; the selected version directory is appended.
         download_base="${PUMMEL_DOWNLOAD_BASE%/}/${version}"
     else
         download_base="https://github.com/${GITHUB_REPO}/releases/download/${version}"
     fi
 
     manifest_path="$SCRATCH_DIR/checksums-sha256.txt"
-    signature_path="$SCRATCH_DIR/checksums-sha256.txt.minisig"
     archive_name="pummel-${version}-${TARGET}.${ARCHIVE_EXT}"
     archive_path="$SCRATCH_DIR/$archive_name"
 
-    info "Downloading signed checksum manifest"
+    info "Downloading checksum manifest"
     curl_download "$download_base/checksums-sha256.txt" "$manifest_path"
-    curl_download "$download_base/checksums-sha256.txt.minisig" "$signature_path"
-    verify_manifest "$manifest_path" "$signature_path"
 
     info "Downloading Pummel archive: $archive_name"
     curl_download "$download_base/$archive_name" "$archive_path"

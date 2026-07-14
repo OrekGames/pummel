@@ -16,6 +16,15 @@ A high-throughput, multithreaded HTTP load testing library and CLI tool for Rust
 
 ## Installation
 
+**Preferred for Rust users:** install from [crates.io](https://crates.io/crates/pummel):
+
+```bash
+cargo install pummel --locked
+```
+
+> The first crates.io publish and checksum-verified GitHub Release are forthcoming
+> until tag `v0.1.0` exists. Until then, build from source.
+
 ### Library
 
 Add the library to your `Cargo.toml`:
@@ -25,23 +34,24 @@ Add the library to your `Cargo.toml`:
 pummel = "0.1.0"
 ```
 
-### Automated Installation
+### Automated binary installers
 
-You can install Pummel securely using the release installers. They require a locally installed and trusted `minisign` binary, discover the latest stable GitHub Release, verify the signed checksum manifest, validate the archive SHA256 checksum, and fail closed if verification cannot be performed.
-
-Install `minisign` first, for example with `brew install minisign` on macOS, `sudo apt-get install minisign` on Debian/Ubuntu, `sudo dnf install minisign` on Fedora, or `sudo pacman -S minisign` on Arch.
+Installers discover the latest stable GitHub Release, download the platform
+archive and `checksums-sha256.txt`, verify the exact-filename SHA-256, and install
+the binary. No `minisign` (or other signing tool) is required.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/OrekGames/pummel/main/scripts/install.sh | bash
 ```
 
-For Windows (PowerShell), install `minisign` first with a trusted package manager such as `winget`, Chocolatey, or Scoop, then run:
+Windows (PowerShell):
 
 ```powershell
 irm https://raw.githubusercontent.com/OrekGames/pummel/main/scripts/install.ps1 | iex
 ```
 
-See the [Installation Documentation](docs/installation.md) for manual verification steps and the release maintainer checklist.
+See the [Installation Documentation](docs/installation.md) for manual verification
+steps and the maintainer release checklist.
 
 ### Build from Source
 

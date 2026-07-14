@@ -1,10 +1,17 @@
 # Pummel Installation and Distribution
 
-Pummel releases are distributed from GitHub Releases with a signed SHA256
-manifest. The trust root is the committed `docs/release-signing.pub` public key
-plus a locally installed `minisign` binary that you trust.
+Pummel is published as a Rust crate on [crates.io](https://crates.io/crates/pummel)
+and as platform binaries on [GitHub Releases](https://github.com/OrekGames/pummel/releases).
 
-The library is also published to [crates.io](https://crates.io/crates/pummel).
+**Preferred install for Rust users:** `cargo install pummel`
+
+Binary installers verify GitHub Release assets by matching the archive SHA-256
+against the exact filename entry in `checksums-sha256.txt`. They do not require
+`minisign` or any separate signing tool.
+
+> **Note:** The first checksum-verified GitHub Release and crates.io publish are
+> forthcoming until tag `v0.1.0` exists. Until then, build from source or wait
+> for that release.
 
 ## 1. Supported Platform Matrix
 
@@ -15,42 +22,31 @@ The library is also published to [crates.io](https://crates.io/crates/pummel).
 | **macOS** | Apple Silicon | `aarch64-apple-darwin` | `tar.gz` |
 | **Windows** | Intel/AMD (x86_64) | `x86_64-pc-windows-msvc` | `zip` |
 
-## 2. Prerequisites
-
-Automated installers deliberately **do not** download `minisign` for you.
-Install `minisign` from a trusted package manager or release source before
-running an installer:
+## 2. Install from crates.io (recommended for Rust users)
 
 ```bash
-# macOS
-brew install minisign
-
-# Debian/Ubuntu
-sudo apt-get install minisign
-
-# Fedora
-sudo dnf install minisign
-
-# Arch
-sudo pacman -S minisign
+cargo install pummel --locked
 ```
 
-On Windows, install `minisign` with a trusted package manager such as `winget`,
-Chocolatey, or Scoop, then ensure `minisign.exe` is available in `PATH`.
+Library dependency:
 
-## 3. Automated Installers
+```toml
+[dependencies]
+pummel = "0.1.0"
+```
+
+## 3. Automated Binary Installers
 
 The installers:
 
 1. Detect the supported OS and architecture before network downloads.
 2. Discover the latest stable GitHub Release tag matching `vMAJOR.MINOR.PATCH`,
-   skipping prereleases.
-3. Download `checksums-sha256.txt` and `checksums-sha256.txt.minisig`.
-4. Verify the manifest with `minisign` and the embedded Pummel public key.
-5. Download exactly one platform archive and compare its SHA256 hash against the
-   exact filename entry in the verified manifest.
-6. Extract only the expected binary member and fail closed on path traversal or
-   unexpected archive contents.
+   skipping prereleases (or use `PUMMEL_VERSION`).
+3. Download `checksums-sha256.txt` and exactly one platform archive.
+4. Compare the archive SHA-256 against the exact filename entry in the
+   checksum manifest (fail closed if the entry is missing or mismatched).
+5. Extract only the expected root binary member and refuse path traversal,
+   unexpected members, and symlink/special members.
 
 ### macOS and Linux
 
@@ -63,6 +59,8 @@ Optional overrides:
 ```bash
 PUMMEL_VERSION=0.1.0 bash scripts/install.sh   # normalized to v0.1.0
 PUMMEL_INSTALL_DIR="$HOME/bin" bash scripts/install.sh
+# Root URL; /${version} is appended automatically:
+PUMMEL_DOWNLOAD_BASE="https://example.invalid/pummel" bash scripts/install.sh
 ```
 
 ### Windows PowerShell
@@ -76,6 +74,7 @@ Optional overrides:
 ```powershell
 $env:PUMMEL_VERSION = "0.1.0"
 $env:PUMMEL_INSTALL_DIR = "$HOME\.local\bin"
+$env:PUMMEL_DOWNLOAD_BASE = "https://example.invalid/pummel"  # /${version} appended
 .\scripts\install.ps1
 ```
 
@@ -90,73 +89,56 @@ ARCHIVE="pummel-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 BASE_URL="https://github.com/OrekGames/pummel/releases/download/${VERSION}"
 ```
 
-Download the public key, signed manifest, detached signature, and archive:
+Download the checksum manifest and archive:
 
 ```bash
-curl --fail --show-error --location -o release-signing.pub \
-  https://raw.githubusercontent.com/OrekGames/pummel/main/docs/release-signing.pub
 curl --fail --show-error --location -O "${BASE_URL}/checksums-sha256.txt"
-curl --fail --show-error --location -O "${BASE_URL}/checksums-sha256.txt.minisig"
 curl --fail --show-error --location -O "${BASE_URL}/${ARCHIVE}"
 ```
 
-Verify the manifest signature:
+Verify the exact archive hash from the manifest:
 
 ```bash
-minisign -V -p release-signing.pub -m checksums-sha256.txt -x checksums-sha256.txt.minisig
-```
-
-Verify the exact archive hash from the trusted manifest:
-
-```bash
-EXPECTED_HASH="$(awk -v name="${ARCHIVE}" '$2 == name { print $1; found=1 } END { if (!found) exit 1 }' checksums-sha256.txt)"
-ACTUAL_HASH="$(shasum -a 256 "${ARCHIVE}" | awk '{ print $1 }')"
+EXPECTED_HASH="$(awk -v name="${ARCHIVE}" '$2 == name { print tolower($1); found=1 } END { if (!found) exit 1 }' checksums-sha256.txt)"
+ACTUAL_HASH="$(shasum -a 256 "${ARCHIVE}" | awk '{ print tolower($1) }')"
 test "${EXPECTED_HASH}" = "${ACTUAL_HASH}"
 ```
 
-Extract and install only after both verification steps succeed. Prefer extracting
+Extract and install only after checksum verification succeeds. Prefer extracting
 a single member:
 
 ```bash
 tar -xzf "${ARCHIVE}" pummel
-install -m 0755 pummel /usr/local/bin/pummel
+install -m 755 pummel /usr/local/bin/pummel
 ```
 
-## 5. Library Installation via crates.io
+On Windows, expand the zip and confirm it contains only a root-level
+`pummel.exe` before copying it onto your `PATH`.
 
-```toml
-[dependencies]
-pummel = "0.1.0"
-```
-
-Or:
+## 5. Build from Source
 
 ```bash
-cargo add pummel
+git clone https://github.com/OrekGames/pummel.git
+cd pummel
+cargo build --release
 ```
 
-## 6. GitHub Release Maintainer Checklist
+The CLI binary is at `target/release/pummel`.
 
-Before cutting a protected release tag:
+## 6. Maintainer Release Checklist
 
-- Use canonical tags of the form `vMAJOR.MINOR.PATCH` only.
-- Ensure `Cargo.toml` version equals the tag without the leading `v`.
-- Store the minisign private key as the protected GitHub Actions secret
-  `MINISIGN_SECRET_KEY` in the `release` environment.
-- Confirm the CI private key matches `docs/release-signing.pub` before the first
-  release; the release workflow verifies the generated signature before upload.
-- Keep private keys out of the repository and never print them in logs.
-- Treat release asset uploads as immutable; do not overwrite published assets for
-  an existing tag.
+For the first public release (`v0.1.0`):
 
-## 7. crates.io Publishing Checklist
+1. Set temporary `CARGO_REGISTRY_TOKEN` in the GitHub Actions `release`
+   environment and set environment variable `FIRST_CRATE_PUBLISH=true`
+   (bootstrap only).
+2. Tag `v0.1.0` (must match `Cargo.toml` version) and push the tag.
+3. Confirm the Release workflow publishes crates.io first, then creates the
+   GitHub Release with four platform archives plus `checksums-sha256.txt`.
+4. Configure crates.io Trusted Publishing for this repository, then revoke the
+   bootstrap token and clear `FIRST_CRATE_PUBLISH`.
+5. Smoke-test `scripts/install.sh`, `scripts/install.ps1`, and
+   `cargo install pummel`.
 
-- Confirm the crate name is still available immediately before first publish.
-- Run `cargo package --list` and `cargo publish --dry-run` locally.
-- For the **first** publish only, set a short-lived `CARGO_REGISTRY_TOKEN` in the
-  protected GitHub `release` environment and let `.github/workflows/release.yml`
-  publish from the `vX.Y.Z` tag.
-- After the first version exists on crates.io, configure Trusted Publishing for
-  repository `OrekGames/pummel`, workflow `release.yml`, and environment
-  `release`, then revoke the bootstrap token.
-- Later releases should authenticate with Trusted Publishing OIDC only.
+Subsequent releases should rely on Trusted Publishing only; leave
+`FIRST_CRATE_PUBLISH` unset so a failed OIDC login fails closed.

@@ -1,11 +1,9 @@
-# Pummel - Secure Installer for Windows
-# Discovers the latest stable GitHub Release, verifies the signed checksum
-# manifest with minisign, validates the archive SHA256 checksum, and installs
-# the platform binary.
+# Pummel - Installer for Windows
+# Discovers the latest stable GitHub Release, verifies the archive SHA256
+# checksum against checksums-sha256.txt, and installs the platform binary.
 
 $ErrorActionPreference = "Stop"
 
-$pubKey = "RWQxie7dcHNLULOnZ3qGIGV5IQHhCs5u48Py3qrbCbGUZ3F6PrHyTCrF"
 $scratchDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pummel-install-" + [Guid]::NewGuid().ToString("N"))
 
 function Get-EnvOrDefault {
@@ -59,14 +57,6 @@ function Get-WindowsTarget {
     }
 }
 
-function Get-MinisignPath {
-    $command = Get-Command -Name minisign.exe,minisign -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $command) {
-        throw "minisign is required. Install it with winget, Chocolatey, Scoop, or from a trusted minisign release source, then rerun this installer."
-    }
-    return $command.Source
-}
-
 function Invoke-Download {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
@@ -77,7 +67,20 @@ function Invoke-Download {
         Accept = "application/vnd.github+json"
         "X-GitHub-Api-Version" = "2022-11-28"
     }
-    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -Headers $headers -UseBasicParsing -ErrorAction Stop | Out-Null
+
+    $attempt = 0
+    while ($true) {
+        $attempt += 1
+        try {
+            Invoke-WebRequest -Uri $Uri -OutFile $OutFile -Headers $headers -UseBasicParsing -ErrorAction Stop | Out-Null
+            return
+        } catch {
+            if ($attempt -ge 3) {
+                throw
+            }
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
 }
 
 function Get-NextPageUrl {
@@ -107,10 +110,22 @@ function Find-LatestStableVersion {
     $versions = [System.Collections.Generic.List[object]]::new()
 
     while (-not [string]::IsNullOrWhiteSpace($uri)) {
-        $response = Invoke-WebRequest -Uri $uri -Headers @{
-            Accept = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
-        } -UseBasicParsing -ErrorAction Stop
+        $attempt = 0
+        while ($true) {
+            $attempt += 1
+            try {
+                $response = Invoke-WebRequest -Uri $uri -Headers @{
+                    Accept = "application/vnd.github+json"
+                    "X-GitHub-Api-Version" = "2022-11-28"
+                } -UseBasicParsing -ErrorAction Stop
+                break
+            } catch {
+                if ($attempt -ge 3) {
+                    throw
+                }
+                Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
 
         $releases = @()
         if (-not [string]::IsNullOrWhiteSpace($response.Content)) {
@@ -127,9 +142,9 @@ function Find-LatestStableVersion {
             $tag = [string]$release.tag_name
             if ($tag -match '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') {
                 $versions.Add([PSCustomObject]@{
-                    Major = [int]$Matches[1]
-                    Minor = [int]$Matches[2]
-                    Patch = [int]$Matches[3]
+                    Major = [bigint]$Matches[1]
+                    Minor = [bigint]$Matches[2]
+                    Patch = [bigint]$Matches[3]
                     Tag = $tag
                 }) | Out-Null
             }
@@ -145,21 +160,6 @@ function Find-LatestStableVersion {
     return ($versions | Sort-Object Major,Minor,Patch | Select-Object -Last 1).Tag
 }
 
-function Assert-ManifestSignature {
-    param(
-        [Parameter(Mandatory = $true)][string]$MinisignPath,
-        [Parameter(Mandatory = $true)][string]$ManifestPath,
-        [Parameter(Mandatory = $true)][string]$SignaturePath,
-        [Parameter(Mandatory = $true)][string]$PublicKey
-    )
-
-    Write-Host "Verifying signed checksum manifest with minisign..."
-    & $MinisignPath -V -P $PublicKey -m $ManifestPath -x $SignaturePath
-    if ($LASTEXITCODE -ne 0) {
-        throw "Signature verification failed for checksums-sha256.txt."
-    }
-}
-
 function Get-ExpectedHash {
     param(
         [Parameter(Mandatory = $true)][string]$ManifestPath,
@@ -172,7 +172,7 @@ function Get-ExpectedHash {
         }
     }
 
-    throw "Archive $ArchiveName not found in verified checksums-sha256.txt."
+    throw "Archive $ArchiveName not found in checksums-sha256.txt."
 }
 
 function Assert-ArchiveChecksum {
@@ -196,9 +196,16 @@ function Assert-SafeZipEntries {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
-        $entries = @($archive.Entries | ForEach-Object { $_.FullName -replace '\\', '/' })
-        if ($entries.Count -ne 1 -or $entries[0] -ne "pummel.exe") {
-            throw "Archive must contain exactly one root-level pummel.exe entry. Found: $($entries -join ', ')"
+        $entries = @($archive.Entries)
+        if ($entries.Count -ne 1) {
+            throw "Archive must contain exactly one entry. Found: $($entries.Count)"
+        }
+        $name = ($entries[0].FullName -replace '\\', '/')
+        if ($name -ne "pummel.exe") {
+            throw "Archive must contain exactly one root-level pummel.exe entry. Found: $name"
+        }
+        if ($name.Contains("..") -or $name.StartsWith("/")) {
+            throw "Refusing unsafe zip entry path: $name"
         }
     } finally {
         $archive.Dispose()
@@ -255,7 +262,6 @@ try {
     $downloadBaseOverride = [Environment]::GetEnvironmentVariable("PUMMEL_DOWNLOAD_BASE")
 
     $targetInfo = Get-WindowsTarget
-    $minisignPath = Get-MinisignPath
 
     if (-not [string]::IsNullOrWhiteSpace($requestedVersion)) {
         $version = Normalize-Version -Version $requestedVersion
@@ -266,21 +272,19 @@ try {
         Write-Host "Found latest stable Pummel version: $version"
     }
 
+    # Same contract as install.sh: override is a root URL; version is appended.
     $downloadBase = if (-not [string]::IsNullOrWhiteSpace($downloadBaseOverride)) {
-        $downloadBaseOverride.TrimEnd('/')
+        ($downloadBaseOverride.TrimEnd('/')) + "/" + $version
     } else {
         "https://github.com/$repo/releases/download/$version"
     }
 
     $manifestPath = Join-Path $scratchDir "checksums-sha256.txt"
-    $signaturePath = Join-Path $scratchDir "checksums-sha256.txt.minisig"
     $archiveName = "pummel-$version-$($targetInfo.Target).$($targetInfo.ArchiveExt)"
     $archivePath = Join-Path $scratchDir $archiveName
 
-    Write-Host "Downloading signed checksum manifest..."
+    Write-Host "Downloading checksum manifest..."
     Invoke-Download -Uri "$downloadBase/checksums-sha256.txt" -OutFile $manifestPath
-    Invoke-Download -Uri "$downloadBase/checksums-sha256.txt.minisig" -OutFile $signaturePath
-    Assert-ManifestSignature -MinisignPath $minisignPath -ManifestPath $manifestPath -SignaturePath $signaturePath -PublicKey $pubKey
 
     Write-Host "Downloading Pummel archive: $archiveName..."
     Invoke-Download -Uri "$downloadBase/$archiveName" -OutFile $archivePath
