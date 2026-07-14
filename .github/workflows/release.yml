@@ -1,0 +1,275 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.96.1"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    name: validate-tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Validate tag and Cargo.toml version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must match vMAJOR.MINOR.PATCH: $tag" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "Tag version $version does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: build-linux
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.validate-tag.outputs.tag }}"
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/pummel dist/pummel
+          tar -C dist -czf "dist/pummel-${tag}-x86_64-unknown-linux-gnu.tar.gz" pummel
+          rm -f dist/pummel
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-x86_64
+          path: dist/pummel-${{ needs.validate-tag.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
+  build-macos-intel:
+    name: build-macos-intel
+    needs: validate-tag
+    runs-on: macos-13
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-apple-darwin
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Build release binary
+        run: cargo build --release --target x86_64-apple-darwin
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.validate-tag.outputs.tag }}"
+          mkdir -p dist
+          tar -C target/x86_64-apple-darwin/release -czf "dist/pummel-${tag}-x86_64-apple-darwin.tar.gz" pummel
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-intel
+          path: dist/pummel-${{ needs.validate-tag.outputs.tag }}-x86_64-apple-darwin.tar.gz
+          if-no-files-found: error
+
+  build-macos-arm:
+    name: build-macos-arm
+    needs: validate-tag
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-apple-darwin
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Build release binary
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.validate-tag.outputs.tag }}"
+          mkdir -p dist
+          tar -C target/aarch64-apple-darwin/release -czf "dist/pummel-${tag}-aarch64-apple-darwin.tar.gz" pummel
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-arm
+          path: dist/pummel-${{ needs.validate-tag.outputs.tag }}-aarch64-apple-darwin.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: build-windows
+    needs: validate-tag
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Build release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Package archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ needs.validate-tag.outputs.tag }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/pummel.exe" `
+            -DestinationPath "dist/pummel-$tag-x86_64-pc-windows-msvc.zip" -Force
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-x86_64
+          path: dist/pummel-${{ needs.validate-tag.outputs.tag }}-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs:
+      - validate-tag
+      - build-linux
+      - build-macos-intel
+      - build-macos-arm
+      - build-windows
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+      - name: Collect artifacts and sign checksums
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          TAG: ${{ needs.validate-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "artifacts/linux-x86_64/pummel-${TAG}-x86_64-unknown-linux-gnu.tar.gz" dist/
+          cp "artifacts/macos-intel/pummel-${TAG}-x86_64-apple-darwin.tar.gz" dist/
+          cp "artifacts/macos-arm/pummel-${TAG}-aarch64-apple-darwin.tar.gz" dist/
+          cp "artifacts/windows-x86_64/pummel-${TAG}-x86_64-pc-windows-msvc.zip" dist/
+
+          cd dist
+          for file in \
+            "pummel-${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
+            "pummel-${TAG}-x86_64-apple-darwin.tar.gz" \
+            "pummel-${TAG}-aarch64-apple-darwin.tar.gz" \
+            "pummel-${TAG}-x86_64-pc-windows-msvc.zip"; do
+            test -f "$file" || { echo "Missing release artifact: $file" >&2; exit 1; }
+          done
+
+          sha256sum \
+            "pummel-${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
+            "pummel-${TAG}-x86_64-apple-darwin.tar.gz" \
+            "pummel-${TAG}-aarch64-apple-darwin.tar.gz" \
+            "pummel-${TAG}-x86_64-pc-windows-msvc.zip" \
+            > checksums-sha256.txt
+
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "Missing MINISIGN_SECRET_KEY secret in the release environment" >&2
+            exit 1
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+          key_file="$(mktemp)"
+          cleanup_key() { rm -f "$key_file"; }
+          trap cleanup_key EXIT
+          chmod 600 "$key_file"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file"
+
+          minisign -S -s "$key_file" -m checksums-sha256.txt
+          minisign -V -p ../docs/release-signing.pub -m checksums-sha256.txt -x checksums-sha256.txt.minisig
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@6cbd405e2c4e67a21c47fa9e383d020e4e28b836 # v2.3.3
+        with:
+          tag_name: ${{ needs.validate-tag.outputs.tag }}
+          name: Release ${{ needs.validate-tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/pummel-${{ needs.validate-tag.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/pummel-${{ needs.validate-tag.outputs.tag }}-x86_64-apple-darwin.tar.gz
+            dist/pummel-${{ needs.validate-tag.outputs.tag }}-aarch64-apple-darwin.tar.gz
+            dist/pummel-${{ needs.validate-tag.outputs.tag }}-x86_64-pc-windows-msvc.zip
+            dist/checksums-sha256.txt
+            dist/checksums-sha256.txt.minisig
+          fail_on_unmatched_files: true
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Authenticate to crates.io via Trusted Publishing
+        id: crates
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@275b31c2bd0ae2dc5fc5b03747ab8c88d6e3b1c6 # v1
+      - name: Publish to crates.io
+        if: steps.crates.outcome == 'success'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates.outputs.token }}
+        run: cargo publish --locked
+      - name: Publish to crates.io with bootstrap token
+        if: steps.crates.outcome != 'success'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "Trusted Publishing is not configured and CARGO_REGISTRY_TOKEN is unset." >&2
+            echo "For the first publish, set CARGO_REGISTRY_TOKEN in the release environment," >&2
+            echo "then configure Trusted Publishing and revoke the bootstrap token." >&2
+            exit 1
+          fi
+          cargo publish --locked

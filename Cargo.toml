@@ -1,0 +1,77 @@
+[package]
+name = "pummel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+description = "A high-throughput, multi-threaded HTTP load testing library"
+authors = ["David Johnson <contact@orekgames.com>"]
+license = "MIT"
+repository = "https://github.com/OrekGames/pummel"
+homepage = "https://github.com/OrekGames/pummel"
+readme = "README.md"
+keywords = ["http", "load-testing", "benchmark", "stress-test", "cli"]
+categories = [
+    "command-line-utilities",
+    "development-tools::testing",
+    "web-programming::http-client",
+]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# HTTP client
+reqwest = { version = "0.12.22", default-features = false, features = ["json", "rustls-tls", "http2"] }
+
+# Serialization/Deserialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9.5"
+serde_yaml_ng = "0.10"
+csv = "1"
+
+# Error handling
+thiserror = "2.0.12"
+
+# Logging and metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.5.0", features = ["derive"] }
+
+# Concurrency and utilities
+futures = "0.3"
+async-trait = "0.1"
+dashmap = "6.1.0"
+
+# Graph visualization
+petgraph = "0.8.2"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random data generation for testing
+rand = "0.9.1"
+
+# Unique identifiers
+uuid = { version = "1.17", features = ["v4"] }
+
+# Dynamic scenario extractors
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = { version = "0.7.0", features = ["html_reports"] }
+
+[[bench]]
+name = "engine_benchmarks"
+harness = false
+
+[[bench]]
+name = "metrics_benchmark"
+harness = false
+
+[[bin]]
+name = "pummel"
+path = "src/bin/cli.rs"

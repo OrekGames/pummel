@@ -1,0 +1,40 @@
+# Data-driven login/profile flow.
+
+[global]
+virtual_users = 2
+duration_seconds = 0
+think_time_ms = 0
+
+[data_sources.users]
+type = "csv"
+path = "fixtures/users.csv"
+access = "per_vu"
+exhaustion = "fail"
+
+[data_sources.users.columns]
+age = "integer"
+active = "bool"
+
+[scenarios.auth_flow]
+name = "Authenticated Fixture Flow"
+steps = ["login", "profile"]
+
+[steps.login]
+name = "Login"
+method = "POST"
+url = "https://api.example.com/login"
+json = '{"username":"{{data.users.username}}","password":"{{data.users.password}}"}'
+
+[[steps.login.extractors]]
+name = "token"
+json_path = "$.token"
+required = true
+
+[steps.profile]
+name = "Profile"
+method = "GET"
+url = "https://api.example.com/profile/{{data.users.username}}"
+dependencies = ["login"]
+
+[steps.profile.headers]
+Authorization = "Bearer {{token}}"

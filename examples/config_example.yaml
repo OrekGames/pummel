@@ -1,0 +1,40 @@
+# Example YAML configuration for load-tester
+
+# Global settings that apply to all scenarios
+global:
+  virtual_users: 5
+  duration_seconds: 30
+  ramp_up_seconds: 0
+  think_time_ms: 0
+
+scenarios:
+  example_scenario:
+    name: "Example Scenario"
+    steps:
+      - "get_homepage"
+      - "get_about"
+    # Any load setting specified here overrides the [global] value; omit one to
+    # inherit the global default.
+    virtual_users: 30
+    duration_seconds: 30
+    ramp_up_seconds: 0
+    think_time_ms: 0
+
+steps:
+  get_homepage:
+    name: "Get Homepage"
+    method: "GET"
+    url: "https://www.example.com/"
+    timeout_ms: 5000
+    max_retries: 3
+    follow_redirects: true
+
+  get_about:
+    name: "Get About Page"
+    method: "GET"
+    url: "https://www.example.com/about"
+    timeout_ms: 5000
+    max_retries: 3
+    follow_redirects: true
+    dependencies:
+      - "get_homepage"  # This step depends on the first step

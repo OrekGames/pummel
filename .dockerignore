@@ -1,0 +1,11 @@
+# Keep the Docker build context small: never ship build output or VCS state.
+target/
+.git/
+.gitignore
+.cargo/
+.track.toml
+.tracker-cache/
+**/*.rs.bk
+.idea/
+.vscode/
+.history/
