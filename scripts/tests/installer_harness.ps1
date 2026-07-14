@@ -213,6 +213,7 @@ try {
     if ($Fail -ne 0 -or $Pass -lt 3) {
         exit 1
     }
+    exit 0
 } finally {
     if (Test-Path -LiteralPath $FixtureRoot) {
         Remove-Item -LiteralPath $FixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
