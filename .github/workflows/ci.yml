@@ -45,7 +45,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -60,7 +60,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run tests
         run: cargo test --verbose --all-features
 
@@ -75,7 +75,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Check examples
         run: cargo check --examples
 
@@ -90,7 +90,7 @@ jobs:
         with:
           toolchain: ${{ env.MSRV }}
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Check with MSRV
         # Use an explicit toolchain selector; never mutate the runner default.
         run: cargo +${{ env.MSRV }} check --all-targets --all-features
@@ -106,7 +106,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build docs
         env:
           RUSTDOCFLAGS: -D warnings
@@ -123,7 +123,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Compile benchmarks
         run: cargo bench --no-run
 
@@ -139,7 +139,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Dry-run crate publish
         run: cargo publish --dry-run
 
