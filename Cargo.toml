@@ -52,7 +52,7 @@ petgraph = "0.8.2"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Random data generation for testing
-rand = "0.9.1"
+rand = "0.10.2"
 
 # Unique identifiers
 uuid = { version = "1.17", features = ["v4"] }

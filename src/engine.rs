@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 use uuid::Uuid;
