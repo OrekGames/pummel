@@ -752,31 +752,14 @@ impl VirtualUserContext {
             }
         }
 
-        // Find steps that depend on the completed step and update their status
-        // This is more efficient than checking all steps
-        let dependent_steps: Vec<&Step> = self
-            .scenario
-            .steps
-            .values()
-            .filter(|step| {
-                // Only consider waiting steps that depend on the completed step
-                if let Some(status) = self.step_statuses.get(&step.id) {
-                    if *status == StepStatus::Waiting {
-                        step.dependencies.contains(step_id)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        // Check if these dependent steps are now ready
-        for step in dependent_steps {
-            if self.are_dependencies_completed(step)
-                && let Some(status) = self.step_statuses.get_mut(&step.id)
-            {
+        let mut is_ready_ids = Vec::new();
+        for (id, step) in self.scenario.steps.iter() {
+            if step.dependencies.contains(step_id) && self.step_statuses.get(id) == Some(&StepStatus::Waiting) && self.are_dependencies_completed(step) {
+                is_ready_ids.push(id.clone());
+            }
+        }
+        for id in is_ready_ids {
+            if let Some(status) = self.step_statuses.get_mut(&id) {
                 *status = StepStatus::Ready;
             }
         }
