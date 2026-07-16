@@ -28,14 +28,20 @@ type HttpClientFactoryFn = Arc<dyn Fn() -> Result<Arc<dyn HttpClient>> + Send + 
 type MetricsCollectorFactoryFn = Arc<dyn Fn() -> Arc<dyn MetricsCollector> + Send + Sync>;
 
 /// Shared async request-attempt start-rate limiter.
+///
+/// Exposed for throughput benchmarks (`benches/throughput_benchmarks.rs`).
+/// Not part of the stable public API.
 #[derive(Debug)]
-struct RateLimiter {
+#[doc(hidden)]
+pub struct RateLimiter {
     interval: Duration,
     next_start: Mutex<Instant>,
 }
 
 impl RateLimiter {
-    fn new(rate_per_second: f64) -> Option<Arc<Self>> {
+    /// Create a limiter that paces starts at `rate_per_second`, or `None` if the rate is invalid.
+    #[doc(hidden)]
+    pub fn new(rate_per_second: f64) -> Option<Arc<Self>> {
         if !rate_per_second.is_finite() || rate_per_second <= 0.0 {
             return None;
         }
@@ -45,24 +51,33 @@ impl RateLimiter {
         }))
     }
 
-    async fn acquire_before_deadline(&self, deadline: Option<Instant>) -> bool {
-        let mut next = self.next_start.lock().await;
-        let now = Instant::now();
-        if deadline.is_some_and(|deadline| now >= deadline) {
-            return false;
-        }
-        if *next > now {
-            if deadline.is_some_and(|deadline| *next >= deadline) {
+    /// Reserve the next start slot, waiting until it is due (or until `deadline`).
+    ///
+    /// Returns `false` if the deadline is already reached or the reserved slot is at/after it.
+    ///
+    /// The mutex is only held while reserving the slot; sleep happens after the
+    /// guard is dropped so concurrent virtual users are not serialized behind
+    /// another task's pacing wait.
+    #[doc(hidden)]
+    pub async fn acquire_before_deadline(&self, deadline: Option<Instant>) -> bool {
+        let sleep_for = {
+            let mut next = self.next_start.lock().await;
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 return false;
             }
-            let sleep_for = *next - now;
+            let start_at = (*next).max(now);
+            if deadline.is_some_and(|deadline| start_at >= deadline) {
+                return false;
+            }
+            *next = start_at + self.interval;
+            start_at.saturating_duration_since(now)
+        };
+        if !sleep_for.is_zero() {
             sleep(sleep_for).await;
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if deadline_expired(deadline) {
                 return false;
             }
-            *next += self.interval;
-        } else {
-            *next = now + self.interval;
         }
         true
     }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use reqwest::{self, Method, StatusCode, Url, header, redirect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,8 +30,8 @@ pub enum Body {
     Text(String),
     /// JSON body
     Json(Value),
-    /// Binary body
-    Binary(Vec<u8>),
+    /// Binary body (refcounted; avoids copying response buffers on the hot path)
+    Binary(Bytes),
 }
 
 impl fmt::Display for Body {
@@ -241,7 +242,7 @@ impl RequestBuilder {
     }
 
     /// Set the request body as binary
-    pub fn binary<B: Into<Vec<u8>>>(mut self, bytes: B) -> Self {
+    pub fn binary<B: Into<Bytes>>(mut self, bytes: B) -> Self {
         self.body = Body::Binary(bytes.into());
         self
     }
@@ -436,7 +437,7 @@ impl Response {
         match &self.body {
             Body::Text(text) => Ok(text.clone()),
             Body::Json(value) => Ok(value.to_string()),
-            Body::Binary(bytes) => String::from_utf8(bytes.clone())
+            Body::Binary(bytes) => String::from_utf8(bytes.to_vec())
                 .map_err(|e| Error::other(format!("Failed to decode response body: {e}"))),
             Body::Empty => Ok(String::new()),
         }
@@ -447,7 +448,7 @@ impl Response {
         match &self.body {
             Body::Text(text) => Ok(text.as_bytes().to_vec()),
             Body::Json(value) => Ok(value.to_string().as_bytes().to_vec()),
-            Body::Binary(bytes) => Ok(bytes.clone()),
+            Body::Binary(bytes) => Ok(bytes.to_vec()),
             Body::Empty => Ok(Vec::new()),
         }
     }
@@ -655,7 +656,8 @@ impl HttpClient for DefaultHttpClient {
             if bytes.is_empty() {
                 Body::Empty
             } else {
-                Body::Binary(bytes.to_vec())
+                // Keep the refcounted buffer from reqwest; avoid an extra heap copy.
+                Body::Binary(bytes)
             }
         };
 
