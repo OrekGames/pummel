@@ -300,19 +300,37 @@ pub(crate) fn validate_data_source_id(id: &str) -> Result<()> {
 }
 
 fn load_rows(id: &str, source: &DataSource, base_dir: &Path) -> Result<Vec<Value>> {
-    let path = resolve_source_path(base_dir, &source.path);
+    let path = resolve_source_path(id, base_dir, &source.path)?;
     match source.kind {
         DataSourceKind::Csv => load_csv_rows(id, source, &path),
         DataSourceKind::Json => load_json_rows(id, source, &path),
     }
 }
 
-fn resolve_source_path(base_dir: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base_dir.join(path)
+fn resolve_source_path(id: &str, base_dir: &Path, path: &str) -> Result<PathBuf> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Err(Error::config(format!(
+            "data source '{id}' path '{path}' is absolute; absolute paths are not allowed for security reasons"
+        )));
+    }
+
+    let resolved = base_dir.join(p);
+
+    let base_canonical = std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical_path) => {
+            if !canonical_path.starts_with(&base_canonical) {
+                return Err(Error::config(format!(
+                    "data source '{id}' path '{path}' attempts to traverse outside the base directory"
+                )));
+            }
+            Ok(resolved)
+        }
+        Err(e) => Err(Error::config(format!(
+            "failed to resolve data source '{id}' path '{path}': {e}"
+        ))),
     }
 }
 
