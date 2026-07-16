@@ -139,16 +139,136 @@ fn create_test_scenario(num_steps: usize, with_dependencies: bool, num_users: u3
 // Helper function to create a test engine with a scenario
 fn create_test_engine(num_steps: usize, with_dependencies: bool, num_users: u32) -> Engine {
     let scenario = create_test_scenario(num_steps, with_dependencies, num_users);
+    engine_from_scenario(scenario)
+}
+
+fn engine_from_scenario(scenario: Scenario) -> Engine {
     let mut engine = Engine::new();
     engine.add_scenario(scenario);
-
-    // Configure the engine to use our mock HTTP client
     engine.with_http_client_factory(|| Ok(Arc::new(MockHttpClient)));
-
-    // Configure the engine to use our mock metrics collector
     engine.with_metrics_collector_factory(|| Arc::new(MockMetricsCollector));
-
     engine
+}
+
+/// Wide DAG: N independent roots (one ready-wave of size N).
+fn create_wide_scenario(num_steps: usize, num_users: u32, duration: Duration) -> Scenario {
+    let mut builder = ScenarioBuilder::new(
+        format!("bench_wide_{num_steps}"),
+        format!("Wide DAG with {num_steps} independent steps"),
+    );
+    for i in 1..=num_steps {
+        builder = builder.step(
+            StepBuilder::new(
+                format!("step_{i}"),
+                format!("Step {i}"),
+                Request::get(format!("https://localhost/{i}"))
+                    .build()
+                    .unwrap(),
+            )
+            .max_retries(0)
+            .timeout(Duration::from_secs(1))
+            .build(),
+        );
+    }
+    builder
+        .virtual_users(num_users)
+        .duration(duration)
+        .ramp_up(Duration::from_secs(0))
+        .think_time(Duration::from_secs(0))
+        .build()
+        .unwrap()
+}
+
+/// Deep chain: step_i depends on step_{i-1} (N sequential ready-waves).
+fn create_deep_scenario(num_steps: usize, num_users: u32, duration: Duration) -> Scenario {
+    let mut builder = ScenarioBuilder::new(
+        format!("bench_deep_{num_steps}"),
+        format!("Deep chain with {num_steps} steps"),
+    );
+    builder = builder.step(
+        StepBuilder::new(
+            "step_1",
+            "Step 1",
+            Request::get("https://localhost/1").build().unwrap(),
+        )
+        .max_retries(0)
+        .timeout(Duration::from_secs(1))
+        .build(),
+    );
+    for i in 2..=num_steps {
+        builder = builder.step(
+            StepBuilder::new(
+                format!("step_{i}"),
+                format!("Step {i}"),
+                Request::get(format!("https://localhost/{i}"))
+                    .build()
+                    .unwrap(),
+            )
+            .dependency(format!("step_{}", i - 1))
+            .max_retries(0)
+            .timeout(Duration::from_secs(1))
+            .build(),
+        );
+    }
+    builder
+        .virtual_users(num_users)
+        .duration(duration)
+        .ramp_up(Duration::from_secs(0))
+        .think_time(Duration::from_secs(0))
+        .build()
+        .unwrap()
+}
+
+/// Diamond / fan-in: one root, many mid-tier dependents, one sink depending on all mids.
+/// Stresses dependent discovery after each mid completes.
+fn create_diamond_scenario(fanout: usize, num_users: u32, duration: Duration) -> Scenario {
+    let mut builder = ScenarioBuilder::new(
+        format!("bench_diamond_{fanout}"),
+        format!("Diamond DAG with fan-out {fanout}"),
+    );
+    builder = builder.step(
+        StepBuilder::new(
+            "root",
+            "Root",
+            Request::get("https://localhost/root").build().unwrap(),
+        )
+        .max_retries(0)
+        .timeout(Duration::from_secs(1))
+        .build(),
+    );
+    for i in 1..=fanout {
+        builder = builder.step(
+            StepBuilder::new(
+                format!("mid_{i}"),
+                format!("Mid {i}"),
+                Request::get(format!("https://localhost/mid/{i}"))
+                    .build()
+                    .unwrap(),
+            )
+            .dependency("root")
+            .max_retries(0)
+            .timeout(Duration::from_secs(1))
+            .build(),
+        );
+    }
+    let mut sink = StepBuilder::new(
+        "sink",
+        "Sink",
+        Request::get("https://localhost/sink").build().unwrap(),
+    )
+    .max_retries(0)
+    .timeout(Duration::from_secs(1));
+    for i in 1..=fanout {
+        sink = sink.dependency(format!("mid_{i}"));
+    }
+    builder = builder.step(sink.build());
+    builder
+        .virtual_users(num_users)
+        .duration(duration)
+        .ramp_up(Duration::from_secs(0))
+        .think_time(Duration::from_secs(0))
+        .build()
+        .unwrap()
 }
 
 // Benchmark scenario creation
@@ -255,11 +375,104 @@ fn bench_run_all_virtual_users(c: &mut Criterion) {
     group.finish();
 }
 
+/// DAG scheduling microbenches: dense shapes + sustained multi-pass load.
+///
+/// Unlike `run_all` / `run_all_virtual_users` (tiny DAGs, duration(0), spawn-heavy),
+/// these intentionally stress graph bookkeeping — ready-set collection, root reset,
+/// and dependent promotion. Filter locally with:
+/// `cargo bench --bench engine_benchmarks -- dag_scheduling`
+fn bench_dag_scheduling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dag_scheduling");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(8));
+
+    let rt = Runtime::new().unwrap();
+    let options = ExecutionOptions::builder()
+        .max_concurrent_requests(256)
+        .build();
+
+    // Single-pass dense shapes (duration 0): bookkeeping per completed DAG.
+    for &size in &[50usize, 100] {
+        let wide = engine_from_scenario(create_wide_scenario(size, 1, Duration::from_secs(0)));
+        group.bench_with_input(BenchmarkId::new("wide_single_pass", size), &size, |b, _| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let _ = wide.run_all(options.clone()).await;
+                });
+            });
+        });
+
+        let deep = engine_from_scenario(create_deep_scenario(size, 1, Duration::from_secs(0)));
+        group.bench_with_input(BenchmarkId::new("deep_single_pass", size), &size, |b, _| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let _ = deep.run_all(options.clone()).await;
+                });
+            });
+        });
+    }
+
+    for &fanout in &[50usize, 100] {
+        let diamond =
+            engine_from_scenario(create_diamond_scenario(fanout, 1, Duration::from_secs(0)));
+        group.bench_with_input(
+            BenchmarkId::new("diamond_single_pass", fanout),
+            &fanout,
+            |b, _| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let _ = diamond.run_all(options.clone()).await;
+                    });
+                });
+            },
+        );
+    }
+
+    // Sustained multi-pass: non-zero duration so reset_statuses runs repeatedly.
+    // Intentionally not duration(0) — that mode is for spawn/dispatch benches (M38).
+    let sustained_duration = Duration::from_millis(200);
+    for &size in &[50usize, 100] {
+        let wide = engine_from_scenario(create_wide_scenario(size, 2, sustained_duration));
+        group.bench_with_input(BenchmarkId::new("wide_sustained", size), &size, |b, _| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let _ = wide.run_all(options.clone()).await;
+                });
+            });
+        });
+
+        let deep = engine_from_scenario(create_deep_scenario(size, 2, sustained_duration));
+        group.bench_with_input(BenchmarkId::new("deep_sustained", size), &size, |b, _| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let _ = deep.run_all(options.clone()).await;
+                });
+            });
+        });
+
+        let diamond = engine_from_scenario(create_diamond_scenario(size, 2, sustained_duration));
+        group.bench_with_input(
+            BenchmarkId::new("diamond_sustained", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let _ = diamond.run_all(options.clone()).await;
+                    });
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_scenario_creation,
     bench_engine_initialization,
     bench_run_all,
     bench_run_all_virtual_users,
+    bench_dag_scheduling,
 );
 criterion_main!(benches);

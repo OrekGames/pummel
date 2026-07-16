@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -248,7 +249,7 @@ pub enum StepStatus {
     /// Step was skipped by a branch condition
     Skipped,
     /// Step has failed
-    Failed(String),
+    Failed(Cow<'static, str>),
 }
 
 /// Terminal result of executing one step (all attempts) in a pass.
@@ -614,6 +615,10 @@ struct VirtualUserContext {
     /// Status of each step
     step_statuses: HashMap<StepId, StepStatus>,
 
+    /// Reused buffer for ready-set StepIds within a DAG pass (avoids fresh Vec
+    /// capacity churn across ready-waves).
+    ready_buf: Vec<StepId>,
+
     /// Execution options
     options: ExecutionOptions,
 
@@ -673,6 +678,7 @@ impl VirtualUserContext {
             metrics_collector,
             telemetry_exporter,
             step_statuses,
+            ready_buf: Vec::new(),
             options,
             semaphore,
             rate_limiter,
@@ -694,8 +700,8 @@ impl VirtualUserContext {
         for status in self.step_statuses.values_mut() {
             *status = StepStatus::Waiting;
         }
-        for step in self.scenario.get_root_steps() {
-            if let Some(status) = self.step_statuses.get_mut(&step.id) {
+        for step_id in &self.scenario.root_step_ids {
+            if let Some(status) = self.step_statuses.get_mut(step_id) {
                 *status = StepStatus::Ready;
             }
         }
@@ -713,15 +719,34 @@ impl VirtualUserContext {
     /// runs), ties broken by step id. Ids (cheap `String` clones) are returned
     /// rather than `&Step` so the caller can drop the `self` borrow before the
     /// concurrent sends.
-    fn get_ready_steps(&self) -> Vec<StepId> {
-        let mut ready: Vec<&Step> = self
-            .scenario
-            .steps
-            .values()
-            .filter(|step| matches!(self.step_statuses.get(&step.id), Some(StepStatus::Ready)))
-            .collect();
-        ready.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.id.cmp(&b.id)));
-        ready.into_iter().map(|step| step.id.clone()).collect()
+    fn take_ready_steps(&mut self) -> Vec<StepId> {
+        self.ready_buf.clear();
+
+        // Walk statuses (typically fewer Ready entries than total steps in deep
+        // DAGs) instead of scanning every scenario step.
+        for (step_id, status) in &self.step_statuses {
+            if matches!(status, StepStatus::Ready) {
+                self.ready_buf.push(step_id.clone());
+            }
+        }
+
+        self.ready_buf.sort_unstable_by(|a, b| {
+            let wa = self
+                .scenario
+                .steps
+                .get(a)
+                .map(|s| s.weight)
+                .unwrap_or_default();
+            let wb = self
+                .scenario
+                .steps
+                .get(b)
+                .map(|s| s.weight)
+                .unwrap_or_default();
+            wb.cmp(&wa).then_with(|| a.cmp(b))
+        });
+
+        std::mem::take(&mut self.ready_buf)
     }
 
     /// Check if all dependencies of a step are completed
@@ -748,34 +773,29 @@ impl VirtualUserContext {
             } else if success {
                 *status = StepStatus::Completed;
             } else {
-                *status = StepStatus::Failed("Step execution failed".to_string());
+                *status = StepStatus::Failed(Cow::Borrowed("Step execution failed"));
             }
         }
 
-        // Find steps that depend on the completed step and update their status
-        // This is more efficient than checking all steps
-        let dependent_steps: Vec<&Step> = self
-            .scenario
-            .steps
-            .values()
-            .filter(|step| {
-                // Only consider waiting steps that depend on the completed step
-                if let Some(status) = self.step_statuses.get(&step.id) {
-                    if *status == StepStatus::Waiting {
-                        step.dependencies.contains(step_id)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            })
-            .collect();
+        // Promote waiting dependents via reverse adjacency (O(out-degree)).
+        let Some(dependent_ids) = self.scenario.dependents.get(step_id) else {
+            return;
+        };
+        // Clone ids so we can mutably borrow `self.step_statuses` / `self.scenario`.
+        let dependent_ids = dependent_ids.clone();
 
-        // Check if these dependent steps are now ready
-        for step in dependent_steps {
+        for dep_step_id in dependent_ids {
+            let Some(step) = self.scenario.steps.get(&dep_step_id) else {
+                continue;
+            };
+            if !matches!(
+                self.step_statuses.get(&dep_step_id),
+                Some(StepStatus::Waiting)
+            ) {
+                continue;
+            }
             if self.are_dependencies_completed(step)
-                && let Some(status) = self.step_statuses.get_mut(&step.id)
+                && let Some(status) = self.step_statuses.get_mut(&dep_step_id)
             {
                 *status = StepStatus::Ready;
             }
@@ -1127,7 +1147,8 @@ impl VirtualUserContext {
             // PHASE 1: collect the ready-set. Empty => every step is terminal, or
             // the remaining steps are blocked by a failed dependency (the Tier-1
             // terminal break) — either way this pass is done.
-            let ready = self.get_ready_steps();
+            let ready = self.take_ready_steps();
+            let ready_cap = ready.len();
             if ready.is_empty() {
                 break;
             }
@@ -1161,6 +1182,11 @@ impl VirtualUserContext {
                 })
                 .collect();
             let outcomes = futures::future::join_all(futures).await;
+
+            // Preserve ready-buffer capacity across waves in this pass.
+            if self.ready_buf.capacity() < ready_cap {
+                self.ready_buf.reserve(ready_cap);
+            }
 
             // PHASE 3: apply terminal status updates for the whole batch, then
             // (if configured) abort on the first failure. Updates are applied
