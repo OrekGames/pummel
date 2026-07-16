@@ -571,6 +571,12 @@ impl DefaultHttpClient {
     /// Builds both the follow-redirects and no-follow clients from the same
     /// spec so their pool / TLS / protocol / header settings cannot drift.
     pub fn from_spec(spec: &ClientSpec) -> Result<Self> {
+        if !spec.verify_ssl {
+            crate::logging::warn!(
+                "TLS certificate verification is disabled (verify_ssl = false); use only with trusted staging hosts"
+            );
+        }
+
         let client_follow = Self::build_client(spec, redirect::Policy::limited(10))?;
         let client_no_follow = Self::build_client(spec, redirect::Policy::none())?;
         Ok(Self {
