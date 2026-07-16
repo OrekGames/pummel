@@ -691,13 +691,13 @@ impl VirtualUserContext {
     /// otherwise steps left `Completed`/`Failed` by the previous pass would
     /// never run again.
     fn reset_statuses(&mut self) {
-        for step in self.scenario.get_steps() {
-            self.step_statuses
-                .insert(step.id.clone(), StepStatus::Waiting);
+        for status in self.step_statuses.values_mut() {
+            *status = StepStatus::Waiting;
         }
         for step in self.scenario.get_root_steps() {
-            self.step_statuses
-                .insert(step.id.clone(), StepStatus::Ready);
+            if let Some(status) = self.step_statuses.get_mut(&step.id) {
+                *status = StepStatus::Ready;
+            }
         }
     }
 
@@ -716,8 +716,8 @@ impl VirtualUserContext {
     fn get_ready_steps(&self) -> Vec<StepId> {
         let mut ready: Vec<&Step> = self
             .scenario
-            .get_steps()
-            .into_iter()
+            .steps
+            .values()
             .filter(|step| matches!(self.step_statuses.get(&step.id), Some(StepStatus::Ready)))
             .collect();
         ready.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.id.cmp(&b.id)));
@@ -742,25 +742,22 @@ impl VirtualUserContext {
     /// Update step statuses after a step completes
     fn update_step_statuses(&mut self, step_id: &StepId, success: bool, skipped: bool) {
         // Update the status of the completed step
-        if skipped {
-            self.step_statuses
-                .insert(step_id.clone(), StepStatus::Skipped);
-        } else if success {
-            self.step_statuses
-                .insert(step_id.clone(), StepStatus::Completed);
-        } else {
-            self.step_statuses.insert(
-                step_id.clone(),
-                StepStatus::Failed("Step execution failed".to_string()),
-            );
+        if let Some(status) = self.step_statuses.get_mut(step_id) {
+            if skipped {
+                *status = StepStatus::Skipped;
+            } else if success {
+                *status = StepStatus::Completed;
+            } else {
+                *status = StepStatus::Failed("Step execution failed".to_string());
+            }
         }
 
         // Find steps that depend on the completed step and update their status
         // This is more efficient than checking all steps
         let dependent_steps: Vec<&Step> = self
             .scenario
-            .get_steps()
-            .into_iter()
+            .steps
+            .values()
             .filter(|step| {
                 // Only consider waiting steps that depend on the completed step
                 if let Some(status) = self.step_statuses.get(&step.id) {
@@ -777,9 +774,10 @@ impl VirtualUserContext {
 
         // Check if these dependent steps are now ready
         for step in dependent_steps {
-            if self.are_dependencies_completed(step) {
-                self.step_statuses
-                    .insert(step.id.clone(), StepStatus::Ready);
+            if self.are_dependencies_completed(step)
+                && let Some(status) = self.step_statuses.get_mut(&step.id)
+            {
+                *status = StepStatus::Ready;
             }
         }
     }
@@ -1137,8 +1135,9 @@ impl VirtualUserContext {
             // Mark the whole ready-set Executing before launching so it is not
             // re-collected; the terminal status is applied in PHASE 3.
             for step_id in &ready {
-                self.step_statuses
-                    .insert(step_id.clone(), StepStatus::Executing);
+                if let Some(status) = self.step_statuses.get_mut(step_id) {
+                    *status = StepStatus::Executing;
+                }
             }
 
             // PHASE 2: run every ready step concurrently over cloned Arcs, so no
