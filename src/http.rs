@@ -573,7 +573,7 @@ impl DefaultHttpClient {
     pub fn from_spec(spec: &ClientSpec) -> Result<Self> {
         if !spec.verify_ssl {
             crate::logging::warn!(
-                "Security warning: TLS certificate verification is disabled. This should only be used for testing with trusted staging hosts."
+                "TLS certificate verification is disabled (verify_ssl = false); use only with trusted staging hosts"
             );
         }
 
