@@ -414,7 +414,7 @@ async fn proof5_body_not_eagerly_json_parsed() {
     // "123" is valid JSON, so the old speculative parse would coerce it into a
     // Body::Json(Number). The fix keeps raw bytes.
     match resp.body() {
-        Body::Binary(bytes) => assert_eq!(bytes, b"123", "raw bytes must be preserved"),
+        Body::Binary(bytes) => assert_eq!(bytes.as_ref(), b"123", "raw bytes must be preserved"),
         other => panic!("expected raw Body::Binary, got eagerly-parsed {other:?}"),
     }
     assert_eq!(
