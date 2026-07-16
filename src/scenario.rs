@@ -699,6 +699,14 @@ pub struct Scenario {
     /// Steps in this scenario
     pub steps: HashMap<StepId, Step>,
 
+    /// Cached ids of root steps (no dependencies), rebuilt when steps change.
+    /// Used by the engine hot path to avoid rescanning `steps` every DAG pass.
+    pub(crate) root_step_ids: Vec<StepId>,
+
+    /// Reverse adjacency: dependency id → steps that list it in `dependencies`.
+    /// Used to promote waiting dependents in O(out-degree) instead of O(steps).
+    pub(crate) dependents: HashMap<StepId, Vec<StepId>>,
+
     /// Number of virtual users to simulate
     pub virtual_users: u32,
 
@@ -731,6 +739,8 @@ impl Scenario {
             id: id.into(),
             name: name.into(),
             steps: HashMap::new(),
+            root_step_ids: Vec::new(),
+            dependents: HashMap::new(),
             virtual_users: 1,
             duration: Duration::from_secs(60),
             ramp_up: Duration::from_secs(0),
@@ -739,6 +749,33 @@ impl Scenario {
             load_profile: None,
             data_sources: HashMap::new(),
             data_source_base_dir: None,
+        }
+    }
+
+    /// Rebuild root-id and reverse-adjacency caches from `steps`.
+    ///
+    /// Call after any mutation of `steps` that bypasses [`Self::add_step`] / builder
+    /// finalize. Safe to call repeatedly.
+    pub fn rebuild_scheduling_cache(&mut self) {
+        self.root_step_ids.clear();
+        self.dependents.clear();
+
+        for step in self.steps.values() {
+            if step.dependencies.is_empty() {
+                self.root_step_ids.push(step.id.clone());
+            }
+            for dep_id in &step.dependencies {
+                self.dependents
+                    .entry(dep_id.clone())
+                    .or_default()
+                    .push(step.id.clone());
+            }
+        }
+
+        // Stable order keeps ready/reset behavior deterministic across runs.
+        self.root_step_ids.sort_unstable();
+        for children in self.dependents.values_mut() {
+            children.sort_unstable();
         }
     }
 
@@ -755,6 +792,7 @@ impl Scenario {
         }
 
         self.steps.insert(step.id.clone(), step);
+        self.rebuild_scheduling_cache();
         Ok(self)
     }
 
@@ -826,6 +864,14 @@ impl Scenario {
 
     /// Get the root steps (steps with no dependencies)
     pub fn get_root_steps(&self) -> Vec<&Step> {
+        if !self.root_step_ids.is_empty() || self.steps.is_empty() {
+            return self
+                .root_step_ids
+                .iter()
+                .filter_map(|id| self.steps.get(id))
+                .collect();
+        }
+        // Fallback when `steps` was mutated without rebuilding the cache.
         self.steps
             .values()
             .filter(|step| step.dependencies.is_empty())
@@ -1060,8 +1106,9 @@ impl ScenarioBuilder {
     /// non-zero virtual-user count). This is the single point where a
     /// misconfigured scenario — including forward references that never resolve
     /// — is rejected.
-    pub fn build(self) -> Result<Scenario> {
+    pub fn build(mut self) -> Result<Scenario> {
         self.scenario.validate()?;
+        self.scenario.rebuild_scheduling_cache();
         Ok(self.scenario)
     }
 }
@@ -1114,6 +1161,11 @@ mod tests {
         let root_steps = scenario.get_root_steps();
         assert_eq!(root_steps.len(), 1);
         assert_eq!(root_steps[0].id, "step1");
+        assert_eq!(scenario.root_step_ids, vec!["step1".to_string()]);
+        assert_eq!(
+            scenario.dependents.get("step1").map(|d| d.as_slice()),
+            Some(["step2".to_string()].as_slice())
+        );
 
         let leaf_steps = scenario.get_leaf_steps();
         assert_eq!(leaf_steps.len(), 1);
