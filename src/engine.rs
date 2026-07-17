@@ -9,7 +9,9 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::data::{LoadedDataSources, extract_json_path, extract_relative_json_path};
+use crate::data::{
+    LoadedDataSources, extract_json_path, extract_json_path_tokens, extract_relative_json_path,
+};
 use crate::error::{Error, Result};
 use crate::graph::{DefaultGraphVisualizer, GraphFormat, GraphVisualizer};
 use crate::http::{HttpClient, HttpClientFactory};
@@ -563,7 +565,11 @@ fn run_extractor(
     match extractor.source {
         ExtractorSource::JsonPath => {
             let value: serde_json::Value = response.json()?;
-            Ok(extract_json_path(&value, &extractor.selector))
+            if let Some(tokens) = extractor.compiled_json_path.as_deref() {
+                Ok(extract_json_path_tokens(&value, tokens))
+            } else {
+                Ok(extract_json_path(&value, &extractor.selector))
+            }
         }
         ExtractorSource::BodyRegex => {
             let body = response_body_text(response)?;
