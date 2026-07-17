@@ -963,10 +963,8 @@ impl VirtualUserContext {
             // treated as a failed attempt (with real elapsed) and falls through
             // to the retry/backoff logic like any other failure.
             let (elapsed, send_result) = {
-                let _permit = match &semaphore {
-                    Some(sem) => Some(sem.acquire().await.unwrap()),
-                    None => None,
-                };
+                // Pace before taking an in-flight permit so concurrency slots
+                // are not held across rate-limiter sleeps.
                 let rate_permit_acquired = match &rate_limiter {
                     Some(rate_limiter) => rate_limiter.acquire_before_deadline(deadline).await,
                     None => true,
@@ -979,6 +977,10 @@ impl VirtualUserContext {
                     truncated = true;
                     break;
                 }
+                let _permit = match &semaphore {
+                    Some(sem) => Some(sem.acquire().await.unwrap()),
+                    None => None,
+                };
                 // Time only the send itself, starting AFTER the in-flight-request
                 // and rate permits are acquired, so queue wait does not inflate
                 // recorded latency or let it exceed step.timeout.
