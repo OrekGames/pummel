@@ -915,8 +915,8 @@ impl VirtualUserContext {
         // - skip entirely when metrics are disabled (noop) and no telemetry
         let use_summary =
             telemetry_exporter.is_none() && metrics_collector.accepts_attempt_summary();
-        let record_full = telemetry_exporter.is_some()
-            || (metrics_collector.records_requests() && !use_summary);
+        let record_full =
+            telemetry_exporter.is_some() || (metrics_collector.records_requests() && !use_summary);
 
         // Base request ID; each attempt gets a unique `-{attempt}` suffix so
         // every send is a distinct metrics record. Only needed on the full path.
@@ -1099,9 +1099,7 @@ impl VirtualUserContext {
                             })
                             .await
                     {
-                        logging::error!(
-                            "Failed to record metrics for step '{step_id}': {err}"
-                        );
+                        logging::error!("Failed to record metrics for step '{step_id}': {err}");
                     }
 
                     if attempt_success {
@@ -1181,9 +1179,7 @@ impl VirtualUserContext {
                             })
                             .await
                     {
-                        logging::error!(
-                            "Failed to record metrics for step '{step_id}': {err}"
-                        );
+                        logging::error!("Failed to record metrics for step '{step_id}': {err}");
                     }
                     last_error = Some(Error::timeout(msg));
                 }

@@ -162,9 +162,5 @@ fn bench_noop_construct_vs_skip(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_full_vs_summary,
-    bench_noop_construct_vs_skip
-);
+criterion_group!(benches, bench_full_vs_summary, bench_noop_construct_vs_skip);
 criterion_main!(benches);

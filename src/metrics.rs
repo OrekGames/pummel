@@ -640,6 +640,7 @@ impl InMemoryMetricsCollector {
     }
 
     /// Apply one attempt to the streaming aggregate (shared by full and slim paths).
+    #[allow(clippy::too_many_arguments)]
     fn record_into_aggregate(
         &self,
         scenario_id: ScenarioId,
@@ -863,8 +864,7 @@ impl MetricsCollector for InMemoryMetricsCollector {
             .or_insert_with(|| Arc::new(StepAggregate::new()))
             .clone();
         // Clone display names only on first insert; later attempts borrow.
-        agg.step_name
-            .get_or_init(|| summary.step_name.to_owned());
+        agg.step_name.get_or_init(|| summary.step_name.to_owned());
         agg.scenario_name
             .get_or_init(|| summary.scenario_name.to_owned());
         agg.record(
@@ -1146,7 +1146,10 @@ mod tests {
         assert_eq!(full_step.total_requests, slim_step.total_requests);
         assert_eq!(full_step.successful_requests, slim_step.successful_requests);
         assert_eq!(full_step.failed_requests, slim_step.failed_requests);
-        assert_eq!(full_step.avg_response_time_ms, slim_step.avg_response_time_ms);
+        assert_eq!(
+            full_step.avg_response_time_ms,
+            slim_step.avg_response_time_ms
+        );
         assert_eq!(full_step.name, slim_step.name);
         assert!(full.accepts_attempt_summary());
         assert!(!NoopMetricsCollector::new().records_requests());
