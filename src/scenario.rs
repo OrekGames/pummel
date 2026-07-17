@@ -108,7 +108,22 @@ impl DynamicRequestSpec {
             crate::http::Body::Empty => None,
             crate::http::Body::Text(text) => Some(DynamicBodyTemplate::Text(text.clone())),
             crate::http::Body::Json(value) => Some(DynamicBodyTemplate::Json(value.to_string())),
-            crate::http::Body::Binary(_) => None,
+            // `RequestBuilder::json` stores pre-serialized UTF-8 bytes as Binary
+            // with Content-Type application/json; treat that as a JSON template.
+            crate::http::Body::Binary(bytes) => {
+                let is_json = request
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("application/json"));
+                if is_json {
+                    String::from_utf8(bytes.to_vec())
+                        .ok()
+                        .map(DynamicBodyTemplate::Json)
+                } else {
+                    None
+                }
+            }
         };
 
         Self {
@@ -139,7 +154,7 @@ pub enum ExtractorSource {
 }
 
 /// Extract a value from a response into the virtual-user state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Extractor {
     /// Variable name to store.
@@ -152,7 +167,23 @@ pub struct Extractor {
     pub header: Option<String>,
     /// Whether missing extraction fails the attempt.
     pub required: bool,
+    /// Compiled `selector` for [`ExtractorSource::BodyRegex`] /
+    /// [`ExtractorSource::HeaderRegex`]. Built once at construction so the
+    /// send path does not recompile on every attempt.
+    pub(crate) compiled_regex: Option<regex::Regex>,
 }
+
+impl PartialEq for Extractor {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.source == other.source
+            && self.selector == other.selector
+            && self.header == other.header
+            && self.required == other.required
+    }
+}
+
+impl Eq for Extractor {}
 
 impl Extractor {
     /// Create a JSON-path extractor.
@@ -163,17 +194,21 @@ impl Extractor {
             selector: path.into(),
             header: None,
             required: true,
+            compiled_regex: None,
         }
     }
 
     /// Create a body-regex extractor.
     pub fn body_regex<N: Into<String>, P: Into<String>>(name: N, regex: P) -> Self {
+        let selector = regex.into();
+        let compiled_regex = regex::Regex::new(&selector).ok();
         Self {
             name: name.into(),
             source: ExtractorSource::BodyRegex,
-            selector: regex.into(),
+            selector,
             header: None,
             required: true,
+            compiled_regex,
         }
     }
 
@@ -185,6 +220,7 @@ impl Extractor {
             selector: header.into(),
             header: None,
             required: true,
+            compiled_regex: None,
         }
     }
 
@@ -194,12 +230,15 @@ impl Extractor {
         header: H,
         regex: P,
     ) -> Self {
+        let selector = regex.into();
+        let compiled_regex = regex::Regex::new(&selector).ok();
         Self {
             name: name.into(),
             source: ExtractorSource::HeaderRegex,
-            selector: regex.into(),
+            selector,
             header: Some(header.into()),
             required: true,
+            compiled_regex,
         }
     }
 
@@ -211,6 +250,7 @@ impl Extractor {
             selector: String::new(),
             header: None,
             required: true,
+            compiled_regex: None,
         }
     }
 
@@ -245,7 +285,7 @@ pub enum BranchOperator {
 }
 
 /// Conditional step execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct BranchCondition {
     /// Variable name to inspect.
@@ -254,7 +294,19 @@ pub struct BranchCondition {
     pub operator: BranchOperator,
     /// Expected value for equals / not_equals.
     pub value: Option<String>,
+    /// Compiled regex for [`BranchOperator::MatchesRegex`].
+    pub(crate) compiled_regex: Option<regex::Regex>,
 }
+
+impl PartialEq for BranchCondition {
+    fn eq(&self, other: &Self) -> bool {
+        self.variable == other.variable
+            && self.operator == other.operator
+            && self.value == other.value
+    }
+}
+
+impl Eq for BranchCondition {}
 
 impl BranchCondition {
     /// Create an `exists` branch condition.
@@ -263,6 +315,7 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::Exists,
             value: None,
+            compiled_regex: None,
         }
     }
 
@@ -272,6 +325,7 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::Equals,
             value: Some(value.into()),
+            compiled_regex: None,
         }
     }
 
@@ -281,6 +335,7 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::NotEquals,
             value: Some(value.into()),
+            compiled_regex: None,
         }
     }
 
@@ -290,6 +345,7 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::GreaterThan,
             value: Some(value.into()),
+            compiled_regex: None,
         }
     }
 
@@ -299,6 +355,7 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::GreaterThanOrEqual,
             value: Some(value.into()),
+            compiled_regex: None,
         }
     }
 
@@ -308,6 +365,7 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::LessThan,
             value: Some(value.into()),
+            compiled_regex: None,
         }
     }
 
@@ -317,15 +375,19 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::LessThanOrEqual,
             value: Some(value.into()),
+            compiled_regex: None,
         }
     }
 
     /// Create a regex branch condition.
     pub fn matches_regex<S: Into<String>, V: Into<String>>(variable: S, pattern: V) -> Self {
+        let value = pattern.into();
+        let compiled_regex = regex::Regex::new(&value).ok();
         Self {
             variable: variable.into(),
             operator: BranchOperator::MatchesRegex,
-            value: Some(pattern.into()),
+            value: Some(value),
+            compiled_regex,
         }
     }
 }

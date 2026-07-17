@@ -220,14 +220,16 @@ impl RequestBuilder {
 
     /// Set the request body as JSON.
     ///
-    /// A serialization failure (e.g. a custom `Serialize` impl that errors, or a
-    /// map with non-string keys) is recorded as an error surfaced by
-    /// [`build`](RequestBuilder::build) rather than silently leaving the
-    /// previous (empty) body in place.
+    /// The body is serialized once here into a refcounted [`Bytes`] buffer
+    /// (`Body::Binary`) so each send clones bytes instead of re-running
+    /// `serde_json`. A serialization failure (e.g. a custom `Serialize` impl
+    /// that errors, or a map with non-string keys) is recorded as an error
+    /// surfaced by [`build`](RequestBuilder::build) rather than silently
+    /// leaving the previous (empty) body in place.
     pub fn json<T: Serialize>(mut self, json: &T) -> Self {
-        match serde_json::to_value(json) {
-            Ok(value) => {
-                self.body = Body::Json(value);
+        match serde_json::to_vec(json) {
+            Ok(bytes) => {
+                self.body = Body::Binary(Bytes::from(bytes));
                 if !self.headers.contains_key(header::CONTENT_TYPE) {
                     let value = header::HeaderValue::from_static("application/json");
                     self.headers.insert(header::CONTENT_TYPE, value);
@@ -727,11 +729,12 @@ mod tests {
 
         assert_eq!(request.method(), &Method::POST);
         match request.body() {
-            Body::Json(body) => {
+            Body::Binary(bytes) => {
+                let body: serde_json::Value = serde_json::from_slice(bytes).unwrap();
                 assert_eq!(body["name"], "Test");
                 assert_eq!(body["value"], 123);
             }
-            _ => panic!("Expected JSON body"),
+            _ => panic!("Expected pre-serialized JSON Binary body"),
         }
 
         let headers = request.headers();

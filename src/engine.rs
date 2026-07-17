@@ -426,11 +426,20 @@ fn branch_matches(
         BranchOperator::LessThanOrEqual => {
             numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a <= b)
         }
-        BranchOperator::MatchesRegex => match (value, &branch.value) {
-            (Some(value), Some(pattern)) => regex::Regex::new(pattern)
-                .map(|regex| regex.is_match(&value_to_template_string(&value)))
-                .unwrap_or(false),
-            _ => false,
+        BranchOperator::MatchesRegex => match value {
+            Some(value) => {
+                let haystack = value_to_template_string(&value);
+                if let Some(regex) = branch.compiled_regex.as_ref() {
+                    regex.is_match(&haystack)
+                } else if let Some(pattern) = &branch.value {
+                    regex::Regex::new(pattern)
+                        .map(|regex| regex.is_match(&haystack))
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            None => false,
         },
     }
 }
@@ -528,16 +537,23 @@ fn response_body_text(response: &crate::http::Response) -> Result<String> {
     response.text()
 }
 
-fn regex_capture(pattern: &str, haystack: &str) -> Result<Option<String>> {
-    let regex = regex::Regex::new(pattern)
-        .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?;
-    Ok(regex.captures(haystack).map(|captures| {
+fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
+    regex.captures(haystack).map(|captures| {
         captures
             .get(1)
             .or_else(|| captures.get(0))
             .map(|m| m.as_str().to_string())
             .unwrap_or_default()
-    }))
+    })
+}
+
+fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<String>> {
+    if let Some(regex) = extractor.compiled_regex.as_ref() {
+        return Ok(regex_capture(regex, haystack));
+    }
+    let regex = regex::Regex::new(&extractor.selector)
+        .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?;
+    Ok(regex_capture(&regex, haystack))
 }
 
 fn run_extractor(
@@ -551,7 +567,7 @@ fn run_extractor(
         }
         ExtractorSource::BodyRegex => {
             let body = response_body_text(response)?;
-            Ok(regex_capture(&extractor.selector, &body)?.map(serde_json::Value::String))
+            Ok(run_extractor_regex(extractor, &body)?.map(serde_json::Value::String))
         }
         ExtractorSource::Header => {
             let value = response
@@ -569,7 +585,7 @@ fn run_extractor(
                 .and_then(|value| value.to_str().ok());
             match header_value {
                 Some(value) => {
-                    Ok(regex_capture(&extractor.selector, value)?.map(serde_json::Value::String))
+                    Ok(run_extractor_regex(extractor, value)?.map(serde_json::Value::String))
                 }
                 None => Ok(None),
             }
