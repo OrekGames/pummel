@@ -78,6 +78,10 @@ name = "throughput_benchmarks"
 harness = false
 
 [[bench]]
+name = "metrics_record_path_benchmarks"
+harness = false
+
+[[bench]]
 name = "hot_path_micro_benchmarks"
 harness = false
 
