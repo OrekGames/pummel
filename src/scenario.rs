@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::DataSource;
+use crate::data::{DataSource, JsonPathToken, parse_json_path};
 use crate::error::{Error, Result};
 use crate::http::{HttpMethod, Request, Response};
 
@@ -31,7 +31,10 @@ pub struct VuContext {
     /// Per-VU variables extracted from prior responses.
     pub vars: HashMap<String, serde_json::Value>,
     /// Data-source rows bound for the current VU iteration.
-    pub data: HashMap<String, serde_json::Value>,
+    ///
+    /// Rows are `Arc`-shared with the loaded fixture so iteration bind is a
+    /// pointer clone rather than a deep `serde_json::Value` copy.
+    pub data: HashMap<String, Arc<serde_json::Value>>,
 }
 
 impl VuContext {
@@ -58,13 +61,13 @@ impl VuContext {
     }
 
     /// Replace data-source rows for the current VU iteration.
-    pub fn set_data_rows(&mut self, data: HashMap<String, serde_json::Value>) {
+    pub fn set_data_rows(&mut self, data: HashMap<String, Arc<serde_json::Value>>) {
         self.data = data;
     }
 
     /// Resolve a bound data-source row by id.
     pub fn get_data(&self, id: &str) -> Option<&serde_json::Value> {
-        self.data.get(id)
+        self.data.get(id).map(AsRef::as_ref)
     }
 }
 
@@ -171,6 +174,9 @@ pub struct Extractor {
     /// [`ExtractorSource::HeaderRegex`]. Built once at construction so the
     /// send path does not recompile on every attempt.
     pub(crate) compiled_regex: Option<regex::Regex>,
+    /// Parsed `selector` for [`ExtractorSource::JsonPath`], built once at
+    /// construction so each extract skips `parse_json_path`.
+    pub(crate) compiled_json_path: Option<Vec<JsonPathToken>>,
 }
 
 impl PartialEq for Extractor {
@@ -188,13 +194,16 @@ impl Eq for Extractor {}
 impl Extractor {
     /// Create a JSON-path extractor.
     pub fn json_path<N: Into<String>, P: Into<String>>(name: N, path: P) -> Self {
+        let selector = path.into();
+        let compiled_json_path = parse_json_path(&selector).ok();
         Self {
             name: name.into(),
             source: ExtractorSource::JsonPath,
-            selector: path.into(),
+            selector,
             header: None,
             required: true,
             compiled_regex: None,
+            compiled_json_path,
         }
     }
 
@@ -209,6 +218,7 @@ impl Extractor {
             header: None,
             required: true,
             compiled_regex,
+            compiled_json_path: None,
         }
     }
 
@@ -221,6 +231,7 @@ impl Extractor {
             header: None,
             required: true,
             compiled_regex: None,
+            compiled_json_path: None,
         }
     }
 
@@ -239,6 +250,7 @@ impl Extractor {
             header: Some(header.into()),
             required: true,
             compiled_regex,
+            compiled_json_path: None,
         }
     }
 
@@ -251,6 +263,7 @@ impl Extractor {
             header: None,
             required: true,
             compiled_regex: None,
+            compiled_json_path: None,
         }
     }
 
