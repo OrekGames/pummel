@@ -1,17 +1,14 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::RngExt;
+use rand::Rng;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::data::{
-    LoadedDataSources, extract_json_path, extract_json_path_tokens, extract_relative_json_path,
-};
+use crate::data::{LoadedDataSources, extract_json_path, extract_relative_json_path};
 use crate::error::{Error, Result};
 use crate::graph::{DefaultGraphVisualizer, GraphFormat, GraphVisualizer};
 use crate::http::{HttpClient, HttpClientFactory};
@@ -30,20 +27,14 @@ type HttpClientFactoryFn = Arc<dyn Fn() -> Result<Arc<dyn HttpClient>> + Send + 
 type MetricsCollectorFactoryFn = Arc<dyn Fn() -> Arc<dyn MetricsCollector> + Send + Sync>;
 
 /// Shared async request-attempt start-rate limiter.
-///
-/// Exposed for throughput benchmarks (`benches/throughput_benchmarks.rs`).
-/// Not part of the stable public API.
 #[derive(Debug)]
-#[doc(hidden)]
-pub struct RateLimiter {
+struct RateLimiter {
     interval: Duration,
     next_start: Mutex<Instant>,
 }
 
 impl RateLimiter {
-    /// Create a limiter that paces starts at `rate_per_second`, or `None` if the rate is invalid.
-    #[doc(hidden)]
-    pub fn new(rate_per_second: f64) -> Option<Arc<Self>> {
+    fn new(rate_per_second: f64) -> Option<Arc<Self>> {
         if !rate_per_second.is_finite() || rate_per_second <= 0.0 {
             return None;
         }
@@ -53,33 +44,24 @@ impl RateLimiter {
         }))
     }
 
-    /// Reserve the next start slot, waiting until it is due (or until `deadline`).
-    ///
-    /// Returns `false` if the deadline is already reached or the reserved slot is at/after it.
-    ///
-    /// The mutex is only held while reserving the slot; sleep happens after the
-    /// guard is dropped so concurrent virtual users are not serialized behind
-    /// another task's pacing wait.
-    #[doc(hidden)]
-    pub async fn acquire_before_deadline(&self, deadline: Option<Instant>) -> bool {
-        let sleep_for = {
-            let mut next = self.next_start.lock().await;
-            let now = Instant::now();
-            if deadline.is_some_and(|deadline| now >= deadline) {
+    async fn acquire_before_deadline(&self, deadline: Option<Instant>) -> bool {
+        let mut next = self.next_start.lock().await;
+        let now = Instant::now();
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            return false;
+        }
+        if *next > now {
+            if deadline.is_some_and(|deadline| *next >= deadline) {
                 return false;
             }
-            let start_at = (*next).max(now);
-            if deadline.is_some_and(|deadline| start_at >= deadline) {
-                return false;
-            }
-            *next = start_at + self.interval;
-            start_at.saturating_duration_since(now)
-        };
-        if !sleep_for.is_zero() {
+            let sleep_for = *next - now;
             sleep(sleep_for).await;
-            if deadline_expired(deadline) {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return false;
             }
+            *next += self.interval;
+        } else {
+            *next = now + self.interval;
         }
         true
     }
@@ -266,7 +248,7 @@ pub enum StepStatus {
     /// Step was skipped by a branch condition
     Skipped,
     /// Step has failed
-    Failed(Cow<'static, str>),
+    Failed(String),
 }
 
 /// Terminal result of executing one step (all attempts) in a pass.
@@ -428,20 +410,11 @@ fn branch_matches(
         BranchOperator::LessThanOrEqual => {
             numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a <= b)
         }
-        BranchOperator::MatchesRegex => match value {
-            Some(value) => {
-                let haystack = value_to_template_string(&value);
-                if let Some(regex) = branch.compiled_regex.as_ref() {
-                    regex.is_match(&haystack)
-                } else if let Some(pattern) = &branch.value {
-                    regex::Regex::new(pattern)
-                        .map(|regex| regex.is_match(&haystack))
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            }
-            None => false,
+        BranchOperator::MatchesRegex => match (value, &branch.value) {
+            (Some(value), Some(pattern)) => regex::Regex::new(pattern)
+                .map(|regex| regex.is_match(&value_to_template_string(&value)))
+                .unwrap_or(false),
+            _ => false,
         },
     }
 }
@@ -539,23 +512,16 @@ fn response_body_text(response: &crate::http::Response) -> Result<String> {
     response.text()
 }
 
-fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
-    regex.captures(haystack).map(|captures| {
+fn regex_capture(pattern: &str, haystack: &str) -> Result<Option<String>> {
+    let regex = regex::Regex::new(pattern)
+        .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?;
+    Ok(regex.captures(haystack).map(|captures| {
         captures
             .get(1)
             .or_else(|| captures.get(0))
             .map(|m| m.as_str().to_string())
             .unwrap_or_default()
-    })
-}
-
-fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<String>> {
-    if let Some(regex) = extractor.compiled_regex.as_ref() {
-        return Ok(regex_capture(regex, haystack));
-    }
-    let regex = regex::Regex::new(&extractor.selector)
-        .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?;
-    Ok(regex_capture(&regex, haystack))
+    }))
 }
 
 fn run_extractor(
@@ -565,15 +531,11 @@ fn run_extractor(
     match extractor.source {
         ExtractorSource::JsonPath => {
             let value: serde_json::Value = response.json()?;
-            if let Some(tokens) = extractor.compiled_json_path.as_deref() {
-                Ok(extract_json_path_tokens(&value, tokens))
-            } else {
-                Ok(extract_json_path(&value, &extractor.selector))
-            }
+            Ok(extract_json_path(&value, &extractor.selector))
         }
         ExtractorSource::BodyRegex => {
             let body = response_body_text(response)?;
-            Ok(run_extractor_regex(extractor, &body)?.map(serde_json::Value::String))
+            Ok(regex_capture(&extractor.selector, &body)?.map(serde_json::Value::String))
         }
         ExtractorSource::Header => {
             let value = response
@@ -591,7 +553,7 @@ fn run_extractor(
                 .and_then(|value| value.to_str().ok());
             match header_value {
                 Some(value) => {
-                    Ok(run_extractor_regex(extractor, value)?.map(serde_json::Value::String))
+                    Ok(regex_capture(&extractor.selector, value)?.map(serde_json::Value::String))
                 }
                 None => Ok(None),
             }
@@ -652,10 +614,6 @@ struct VirtualUserContext {
     /// Status of each step
     step_statuses: HashMap<StepId, StepStatus>,
 
-    /// Reused buffer for ready-set StepIds within a DAG pass (avoids fresh Vec
-    /// capacity churn across ready-waves).
-    ready_buf: Vec<StepId>,
-
     /// Execution options
     options: ExecutionOptions,
 
@@ -715,7 +673,6 @@ impl VirtualUserContext {
             metrics_collector,
             telemetry_exporter,
             step_statuses,
-            ready_buf: Vec::new(),
             options,
             semaphore,
             rate_limiter,
@@ -734,13 +691,13 @@ impl VirtualUserContext {
     /// otherwise steps left `Completed`/`Failed` by the previous pass would
     /// never run again.
     fn reset_statuses(&mut self) {
-        for status in self.step_statuses.values_mut() {
-            *status = StepStatus::Waiting;
+        for step in self.scenario.get_steps() {
+            self.step_statuses
+                .insert(step.id.clone(), StepStatus::Waiting);
         }
-        for step_id in &self.scenario.root_step_ids {
-            if let Some(status) = self.step_statuses.get_mut(step_id) {
-                *status = StepStatus::Ready;
-            }
+        for step in self.scenario.get_root_steps() {
+            self.step_statuses
+                .insert(step.id.clone(), StepStatus::Ready);
         }
     }
 
@@ -756,34 +713,15 @@ impl VirtualUserContext {
     /// runs), ties broken by step id. Ids (cheap `String` clones) are returned
     /// rather than `&Step` so the caller can drop the `self` borrow before the
     /// concurrent sends.
-    fn take_ready_steps(&mut self) -> Vec<StepId> {
-        self.ready_buf.clear();
-
-        // Walk statuses (typically fewer Ready entries than total steps in deep
-        // DAGs) instead of scanning every scenario step.
-        for (step_id, status) in &self.step_statuses {
-            if matches!(status, StepStatus::Ready) {
-                self.ready_buf.push(step_id.clone());
-            }
-        }
-
-        self.ready_buf.sort_unstable_by(|a, b| {
-            let wa = self
-                .scenario
-                .steps
-                .get(a)
-                .map(|s| s.weight)
-                .unwrap_or_default();
-            let wb = self
-                .scenario
-                .steps
-                .get(b)
-                .map(|s| s.weight)
-                .unwrap_or_default();
-            wb.cmp(&wa).then_with(|| a.cmp(b))
-        });
-
-        std::mem::take(&mut self.ready_buf)
+    fn get_ready_steps(&self) -> Vec<StepId> {
+        let mut ready: Vec<&Step> = self
+            .scenario
+            .get_steps()
+            .into_iter()
+            .filter(|step| matches!(self.step_statuses.get(&step.id), Some(StepStatus::Ready)))
+            .collect();
+        ready.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.id.cmp(&b.id)));
+        ready.into_iter().map(|step| step.id.clone()).collect()
     }
 
     /// Check if all dependencies of a step are completed
@@ -804,37 +742,44 @@ impl VirtualUserContext {
     /// Update step statuses after a step completes
     fn update_step_statuses(&mut self, step_id: &StepId, success: bool, skipped: bool) {
         // Update the status of the completed step
-        if let Some(status) = self.step_statuses.get_mut(step_id) {
-            if skipped {
-                *status = StepStatus::Skipped;
-            } else if success {
-                *status = StepStatus::Completed;
-            } else {
-                *status = StepStatus::Failed(Cow::Borrowed("Step execution failed"));
-            }
+        if skipped {
+            self.step_statuses
+                .insert(step_id.clone(), StepStatus::Skipped);
+        } else if success {
+            self.step_statuses
+                .insert(step_id.clone(), StepStatus::Completed);
+        } else {
+            self.step_statuses.insert(
+                step_id.clone(),
+                StepStatus::Failed("Step execution failed".to_string()),
+            );
         }
 
-        // Promote waiting dependents via reverse adjacency (O(out-degree)).
-        let Some(dependent_ids) = self.scenario.dependents.get(step_id) else {
-            return;
-        };
-        // Clone ids so we can mutably borrow `self.step_statuses` / `self.scenario`.
-        let dependent_ids = dependent_ids.clone();
+        // Find steps that depend on the completed step and update their status
+        // This is more efficient than checking all steps
+        let dependent_steps: Vec<&Step> = self
+            .scenario
+            .get_steps()
+            .into_iter()
+            .filter(|step| {
+                // Only consider waiting steps that depend on the completed step
+                if let Some(status) = self.step_statuses.get(&step.id) {
+                    if *status == StepStatus::Waiting {
+                        step.dependencies.contains(step_id)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            })
+            .collect();
 
-        for dep_step_id in dependent_ids {
-            let Some(step) = self.scenario.steps.get(&dep_step_id) else {
-                continue;
-            };
-            if !matches!(
-                self.step_statuses.get(&dep_step_id),
-                Some(StepStatus::Waiting)
-            ) {
-                continue;
-            }
-            if self.are_dependencies_completed(step)
-                && let Some(status) = self.step_statuses.get_mut(&dep_step_id)
-            {
-                *status = StepStatus::Ready;
+        // Check if these dependent steps are now ready
+        for step in dependent_steps {
+            if self.are_dependencies_completed(step) {
+                self.step_statuses
+                    .insert(step.id.clone(), StepStatus::Ready);
             }
         }
     }
@@ -985,8 +930,10 @@ impl VirtualUserContext {
             // treated as a failed attempt (with real elapsed) and falls through
             // to the retry/backoff logic like any other failure.
             let (elapsed, send_result) = {
-                // Pace before taking an in-flight permit so concurrency slots
-                // are not held across rate-limiter sleeps.
+                let _permit = match &semaphore {
+                    Some(sem) => Some(sem.acquire().await.unwrap()),
+                    None => None,
+                };
                 let rate_permit_acquired = match &rate_limiter {
                     Some(rate_limiter) => rate_limiter.acquire_before_deadline(deadline).await,
                     None => true,
@@ -999,10 +946,6 @@ impl VirtualUserContext {
                     truncated = true;
                     break;
                 }
-                let _permit = match &semaphore {
-                    Some(sem) => Some(sem.acquire().await.unwrap()),
-                    None => None,
-                };
                 // Time only the send itself, starting AFTER the in-flight-request
                 // and rate permits are acquired, so queue wait does not inflate
                 // recorded latency or let it exceed step.timeout.
@@ -1186,8 +1129,7 @@ impl VirtualUserContext {
             // PHASE 1: collect the ready-set. Empty => every step is terminal, or
             // the remaining steps are blocked by a failed dependency (the Tier-1
             // terminal break) — either way this pass is done.
-            let ready = self.take_ready_steps();
-            let ready_cap = ready.len();
+            let ready = self.get_ready_steps();
             if ready.is_empty() {
                 break;
             }
@@ -1195,9 +1137,8 @@ impl VirtualUserContext {
             // Mark the whole ready-set Executing before launching so it is not
             // re-collected; the terminal status is applied in PHASE 3.
             for step_id in &ready {
-                if let Some(status) = self.step_statuses.get_mut(step_id) {
-                    *status = StepStatus::Executing;
-                }
+                self.step_statuses
+                    .insert(step_id.clone(), StepStatus::Executing);
             }
 
             // PHASE 2: run every ready step concurrently over cloned Arcs, so no
@@ -1221,11 +1162,6 @@ impl VirtualUserContext {
                 })
                 .collect();
             let outcomes = futures::future::join_all(futures).await;
-
-            // Preserve ready-buffer capacity across waves in this pass.
-            if self.ready_buf.capacity() < ready_cap {
-                self.ready_buf.reserve(ready_cap);
-            }
 
             // PHASE 3: apply terminal status updates for the whole batch, then
             // (if configured) abort on the first failure. Updates are applied

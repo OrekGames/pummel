@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rand::RngExt;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -154,7 +154,7 @@ pub enum CsvColumnType {
 pub(crate) struct LoadedDataSource {
     id: String,
     config: DataSource,
-    rows: Vec<Arc<Value>>,
+    rows: Vec<Value>,
     cursor: AtomicU64,
 }
 
@@ -163,7 +163,7 @@ impl LoadedDataSource {
         Self {
             id,
             config,
-            rows: rows.into_iter().map(Arc::new).collect(),
+            rows,
             cursor: AtomicU64::new(0),
         }
     }
@@ -172,7 +172,7 @@ impl LoadedDataSource {
         self.rows.len()
     }
 
-    fn row_at(&self, index: u64) -> Result<Arc<Value>> {
+    fn row_at(&self, index: u64) -> Result<Value> {
         let row_count = self.rows.len() as u64;
         if row_count == 0 {
             return Err(Error::config(format!(
@@ -190,14 +190,14 @@ impl LoadedDataSource {
             DataExhaustion::Fail => index,
             DataExhaustion::Wrap => index % row_count,
         };
-        Ok(Arc::clone(&self.rows[index as usize]))
+        Ok(self.rows[index as usize].clone())
     }
 
-    fn bind_for_iteration(&self, vu_id: u32, iteration: u64) -> Result<Arc<Value>> {
+    fn bind_for_iteration(&self, vu_id: u32, iteration: u64) -> Result<Value> {
         match self.config.access {
             DataAccessMode::PerVu => self.row_at(vu_id as u64),
             DataAccessMode::Sequential => {
-                let index = self.cursor.fetch_add(1, Ordering::Relaxed);
+                let index = self.cursor.fetch_add(1, Ordering::SeqCst);
                 self.row_at(index)
             }
             DataAccessMode::Random => {
@@ -212,7 +212,7 @@ impl LoadedDataSource {
                     Some(seed) => stable_random_index(seed, &self.id, vu_id, iteration, row_count),
                     None => rand::rng().random_range(0..row_count),
                 };
-                Ok(Arc::clone(&self.rows[index]))
+                Ok(self.rows[index].clone())
             }
         }
     }
@@ -220,7 +220,7 @@ impl LoadedDataSource {
     fn path_exists_for_every_row(&self, path: &str) -> bool {
         self.rows
             .iter()
-            .all(|row| extract_relative_json_path(row.as_ref(), path).is_some())
+            .all(|row| extract_relative_json_path(row, path).is_some())
     }
 }
 
@@ -256,7 +256,7 @@ impl LoadedDataSources {
         &self,
         vu_id: u32,
         iteration: u64,
-    ) -> Result<HashMap<String, Arc<Value>>> {
+    ) -> Result<HashMap<String, Value>> {
         let mut bound = HashMap::with_capacity(self.sources.len());
         for (id, source) in &self.sources {
             bound.insert(id.clone(), source.bind_for_iteration(vu_id, iteration)?);
@@ -507,12 +507,7 @@ pub(crate) fn validate_relative_json_path(path: &str) -> Result<()> {
 /// Extract using the documented JSON-path subset.
 pub(crate) fn extract_json_path(value: &Value, path: &str) -> Option<Value> {
     let tokens = parse_json_path(path).ok()?;
-    extract_json_path_tokens(value, &tokens)
-}
-
-/// Extract using pre-parsed JSON-path tokens (hot path for extractors).
-pub(crate) fn extract_json_path_tokens(value: &Value, tokens: &[JsonPathToken]) -> Option<Value> {
-    extract_tokens(value, tokens).cloned()
+    extract_tokens(value, &tokens).cloned()
 }
 
 /// Extract from a data row using a relative path.
@@ -521,7 +516,7 @@ pub(crate) fn extract_relative_json_path(value: &Value, path: &str) -> Option<Va
         return extract_json_path(value, path);
     }
     let tokens = parse_json_path(&format!("$.{path}")).ok()?;
-    extract_json_path_tokens(value, &tokens)
+    extract_tokens(value, &tokens).cloned()
 }
 
 fn extract_tokens<'a>(value: &'a Value, tokens: &[JsonPathToken]) -> Option<&'a Value> {
@@ -539,17 +534,13 @@ fn extract_tokens<'a>(value: &'a Value, tokens: &[JsonPathToken]) -> Option<&'a 
     Some(current)
 }
 
-/// One segment of the supported JSON-path subset (`$.a[0].b`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum JsonPathToken {
-    /// Object field access.
+enum JsonPathToken {
     Field(String),
-    /// Array index access.
     Index(usize),
 }
 
-/// Parse the documented JSON-path subset into tokens.
-pub(crate) fn parse_json_path(path: &str) -> Result<Vec<JsonPathToken>> {
+fn parse_json_path(path: &str) -> Result<Vec<JsonPathToken>> {
     if path.is_empty() {
         return Err(Error::config("json path cannot be empty"));
     }
