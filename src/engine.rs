@@ -521,13 +521,15 @@ fn render_request(
             }
             DynamicBodyTemplate::Json(template) => {
                 let rendered = render_template(ctx, &step.id, template)?;
-                let value: serde_json::Value = serde_json::from_str(&rendered).map_err(|e| {
+                // We just need to validate it is a valid JSON before sending it as raw_json.
+                // We use IgnoredAny to skip building a full Value tree.
+                serde_json::from_str::<serde::de::IgnoredAny>(&rendered).map_err(|e| {
                     Error::validation(format!(
                         "Rendered JSON body for step '{}' is invalid: {e}",
                         step.id
                     ))
                 })?;
-                builder = builder.json(&value);
+                builder = builder.raw_json(rendered);
             }
         }
     }

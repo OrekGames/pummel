@@ -218,6 +218,16 @@ impl RequestBuilder {
         self
     }
 
+    /// Set the request body from pre-serialized or validated JSON bytes.
+    pub fn raw_json<B: Into<Bytes>>(mut self, body: B) -> Self {
+        self.body = Body::Binary(body.into());
+        if !self.headers.contains_key(header::CONTENT_TYPE) {
+            let value = header::HeaderValue::from_static("application/json");
+            self.headers.insert(header::CONTENT_TYPE, value);
+        }
+        self
+    }
+
     /// Set the request body as JSON.
     ///
     /// The body is serialized once here into a refcounted [`Bytes`] buffer
