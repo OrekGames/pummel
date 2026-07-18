@@ -41,7 +41,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5.0", features = ["derive"] }
 
 # Concurrency and utilities
-bytes = "1"
 futures = "0.3"
 async-trait = "0.1"
 dashmap = "6.1.0"
@@ -71,18 +70,6 @@ harness = false
 
 [[bench]]
 name = "metrics_benchmark"
-harness = false
-
-[[bench]]
-name = "throughput_benchmarks"
-harness = false
-
-[[bench]]
-name = "hot_path_micro_benchmarks"
-harness = false
-
-[[bench]]
-name = "data_path_benchmarks"
 harness = false
 
 [[bin]]
