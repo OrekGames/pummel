@@ -236,7 +236,7 @@ impl Config {
             if let Some(json) = &step.json {
                 validate_template(&format!("steps.{step_id}.json"), json)?;
                 if !contains_template(json) {
-                    serde_json::from_str::<serde_json::Value>(json).map_err(|e| {
+                    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|e| {
                         Error::config(format!("Invalid JSON for step '{step_id}': {e}"))
                     })?;
                 }
