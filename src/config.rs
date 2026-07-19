@@ -410,7 +410,9 @@ impl Config {
         } else if let Some(json) = &config.json {
             serde_json::from_str::<serde::de::IgnoredAny>(json)
                 .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
-            request.header("content-type", "application/json").text(json)
+            request
+                .header("content-type", "application/json")
+                .text(json)
         } else {
             request
         };

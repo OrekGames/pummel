@@ -521,9 +521,15 @@ fn render_request(
             }
             DynamicBodyTemplate::Json(template) => {
                 let rendered = render_template(ctx, &step.id, template)?;
-                serde_json::from_str::<serde::de::IgnoredAny>(&rendered)
-                    .map_err(|e| Error::validation(format!("Rendered JSON body for step '{}' is invalid: {e}", step.id)))?;
-                builder = builder.header("content-type", "application/json").text(rendered);
+                serde_json::from_str::<serde::de::IgnoredAny>(&rendered).map_err(|e| {
+                    Error::validation(format!(
+                        "Rendered JSON body for step '{}' is invalid: {e}",
+                        step.id
+                    ))
+                })?;
+                builder = builder
+                    .header("content-type", "application/json")
+                    .text(rendered);
             }
         }
     }
