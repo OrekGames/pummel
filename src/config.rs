@@ -236,7 +236,7 @@ impl Config {
             if let Some(json) = &step.json {
                 validate_template(&format!("steps.{step_id}.json"), json)?;
                 if !contains_template(json) {
-                    serde_json::from_str::<serde_json::Value>(json).map_err(|e| {
+                    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|e| {
                         Error::config(format!("Invalid JSON for step '{step_id}': {e}"))
                     })?;
                 }
@@ -408,10 +408,11 @@ impl Config {
         } else if let Some(body) = &config.body {
             request.text(body)
         } else if let Some(json) = &config.json {
-            // Parse the JSON string into a serde_json::Value
-            let json_value: serde_json::Value = serde_json::from_str(json)
+            serde_json::from_str::<serde::de::IgnoredAny>(json)
                 .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
-            request.json(&json_value)
+            request
+                .header("content-type", "application/json")
+                .text(json)
         } else {
             request
         };
