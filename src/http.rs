@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use reqwest::{self, Method, StatusCode, Url, header, redirect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,8 +29,8 @@ pub enum Body {
     Text(String),
     /// JSON body
     Json(Value),
-    /// Binary body (refcounted; avoids copying response buffers on the hot path)
-    Binary(Bytes),
+    /// Binary body
+    Binary(Vec<u8>),
 }
 
 impl fmt::Display for Body {
@@ -220,16 +219,14 @@ impl RequestBuilder {
 
     /// Set the request body as JSON.
     ///
-    /// The body is serialized once here into a refcounted [`Bytes`] buffer
-    /// (`Body::Binary`) so each send clones bytes instead of re-running
-    /// `serde_json`. A serialization failure (e.g. a custom `Serialize` impl
-    /// that errors, or a map with non-string keys) is recorded as an error
-    /// surfaced by [`build`](RequestBuilder::build) rather than silently
-    /// leaving the previous (empty) body in place.
+    /// A serialization failure (e.g. a custom `Serialize` impl that errors, or a
+    /// map with non-string keys) is recorded as an error surfaced by
+    /// [`build`](RequestBuilder::build) rather than silently leaving the
+    /// previous (empty) body in place.
     pub fn json<T: Serialize>(mut self, json: &T) -> Self {
-        match serde_json::to_vec(json) {
-            Ok(bytes) => {
-                self.body = Body::Binary(Bytes::from(bytes));
+        match serde_json::to_value(json) {
+            Ok(value) => {
+                self.body = Body::Json(value);
                 if !self.headers.contains_key(header::CONTENT_TYPE) {
                     let value = header::HeaderValue::from_static("application/json");
                     self.headers.insert(header::CONTENT_TYPE, value);
@@ -244,7 +241,7 @@ impl RequestBuilder {
     }
 
     /// Set the request body as binary
-    pub fn binary<B: Into<Bytes>>(mut self, bytes: B) -> Self {
+    pub fn binary<B: Into<Vec<u8>>>(mut self, bytes: B) -> Self {
         self.body = Body::Binary(bytes.into());
         self
     }
@@ -439,7 +436,7 @@ impl Response {
         match &self.body {
             Body::Text(text) => Ok(text.clone()),
             Body::Json(value) => Ok(value.to_string()),
-            Body::Binary(bytes) => String::from_utf8(bytes.to_vec())
+            Body::Binary(bytes) => String::from_utf8(bytes.clone())
                 .map_err(|e| Error::other(format!("Failed to decode response body: {e}"))),
             Body::Empty => Ok(String::new()),
         }
@@ -450,7 +447,7 @@ impl Response {
         match &self.body {
             Body::Text(text) => Ok(text.as_bytes().to_vec()),
             Body::Json(value) => Ok(value.to_string().as_bytes().to_vec()),
-            Body::Binary(bytes) => Ok(bytes.to_vec()),
+            Body::Binary(bytes) => Ok(bytes.clone()),
             Body::Empty => Ok(Vec::new()),
         }
     }
@@ -574,12 +571,6 @@ impl DefaultHttpClient {
     /// Builds both the follow-redirects and no-follow clients from the same
     /// spec so their pool / TLS / protocol / header settings cannot drift.
     pub fn from_spec(spec: &ClientSpec) -> Result<Self> {
-        if !spec.verify_ssl {
-            crate::logging::warn!(
-                "TLS certificate verification is disabled (verify_ssl = false); use only with trusted staging hosts"
-            );
-        }
-
         let client_follow = Self::build_client(spec, redirect::Policy::limited(10))?;
         let client_no_follow = Self::build_client(spec, redirect::Policy::none())?;
         Ok(Self {
@@ -658,8 +649,7 @@ impl HttpClient for DefaultHttpClient {
             if bytes.is_empty() {
                 Body::Empty
             } else {
-                // Keep the refcounted buffer from reqwest; avoid an extra heap copy.
-                Body::Binary(bytes)
+                Body::Binary(bytes.to_vec())
             }
         };
 
@@ -729,12 +719,11 @@ mod tests {
 
         assert_eq!(request.method(), &Method::POST);
         match request.body() {
-            Body::Binary(bytes) => {
-                let body: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            Body::Json(body) => {
                 assert_eq!(body["name"], "Test");
                 assert_eq!(body["value"], 123);
             }
-            _ => panic!("Expected pre-serialized JSON Binary body"),
+            _ => panic!("Expected JSON body"),
         }
 
         let headers = request.headers();

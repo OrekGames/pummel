@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::{DataSource, JsonPathToken, parse_json_path};
+use crate::data::DataSource;
 use crate::error::{Error, Result};
 use crate::http::{HttpMethod, Request, Response};
 
@@ -31,10 +31,7 @@ pub struct VuContext {
     /// Per-VU variables extracted from prior responses.
     pub vars: HashMap<String, serde_json::Value>,
     /// Data-source rows bound for the current VU iteration.
-    ///
-    /// Rows are `Arc`-shared with the loaded fixture so iteration bind is a
-    /// pointer clone rather than a deep `serde_json::Value` copy.
-    pub data: HashMap<String, Arc<serde_json::Value>>,
+    pub data: HashMap<String, serde_json::Value>,
 }
 
 impl VuContext {
@@ -61,13 +58,13 @@ impl VuContext {
     }
 
     /// Replace data-source rows for the current VU iteration.
-    pub fn set_data_rows(&mut self, data: HashMap<String, Arc<serde_json::Value>>) {
+    pub fn set_data_rows(&mut self, data: HashMap<String, serde_json::Value>) {
         self.data = data;
     }
 
     /// Resolve a bound data-source row by id.
     pub fn get_data(&self, id: &str) -> Option<&serde_json::Value> {
-        self.data.get(id).map(AsRef::as_ref)
+        self.data.get(id)
     }
 }
 
@@ -111,22 +108,7 @@ impl DynamicRequestSpec {
             crate::http::Body::Empty => None,
             crate::http::Body::Text(text) => Some(DynamicBodyTemplate::Text(text.clone())),
             crate::http::Body::Json(value) => Some(DynamicBodyTemplate::Json(value.to_string())),
-            // `RequestBuilder::json` stores pre-serialized UTF-8 bytes as Binary
-            // with Content-Type application/json; treat that as a JSON template.
-            crate::http::Body::Binary(bytes) => {
-                let is_json = request
-                    .headers()
-                    .get("content-type")
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.starts_with("application/json"));
-                if is_json {
-                    String::from_utf8(bytes.to_vec())
-                        .ok()
-                        .map(DynamicBodyTemplate::Json)
-                } else {
-                    None
-                }
-            }
+            crate::http::Body::Binary(_) => None,
         };
 
         Self {
@@ -157,7 +139,7 @@ pub enum ExtractorSource {
 }
 
 /// Extract a value from a response into the virtual-user state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Extractor {
     /// Variable name to store.
@@ -170,55 +152,28 @@ pub struct Extractor {
     pub header: Option<String>,
     /// Whether missing extraction fails the attempt.
     pub required: bool,
-    /// Compiled `selector` for [`ExtractorSource::BodyRegex`] /
-    /// [`ExtractorSource::HeaderRegex`]. Built once at construction so the
-    /// send path does not recompile on every attempt.
-    pub(crate) compiled_regex: Option<regex::Regex>,
-    /// Parsed `selector` for [`ExtractorSource::JsonPath`], built once at
-    /// construction so each extract skips `parse_json_path`.
-    pub(crate) compiled_json_path: Option<Vec<JsonPathToken>>,
 }
-
-impl PartialEq for Extractor {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.source == other.source
-            && self.selector == other.selector
-            && self.header == other.header
-            && self.required == other.required
-    }
-}
-
-impl Eq for Extractor {}
 
 impl Extractor {
     /// Create a JSON-path extractor.
     pub fn json_path<N: Into<String>, P: Into<String>>(name: N, path: P) -> Self {
-        let selector = path.into();
-        let compiled_json_path = parse_json_path(&selector).ok();
         Self {
             name: name.into(),
             source: ExtractorSource::JsonPath,
-            selector,
+            selector: path.into(),
             header: None,
             required: true,
-            compiled_regex: None,
-            compiled_json_path,
         }
     }
 
     /// Create a body-regex extractor.
     pub fn body_regex<N: Into<String>, P: Into<String>>(name: N, regex: P) -> Self {
-        let selector = regex.into();
-        let compiled_regex = regex::Regex::new(&selector).ok();
         Self {
             name: name.into(),
             source: ExtractorSource::BodyRegex,
-            selector,
+            selector: regex.into(),
             header: None,
             required: true,
-            compiled_regex,
-            compiled_json_path: None,
         }
     }
 
@@ -230,8 +185,6 @@ impl Extractor {
             selector: header.into(),
             header: None,
             required: true,
-            compiled_regex: None,
-            compiled_json_path: None,
         }
     }
 
@@ -241,16 +194,12 @@ impl Extractor {
         header: H,
         regex: P,
     ) -> Self {
-        let selector = regex.into();
-        let compiled_regex = regex::Regex::new(&selector).ok();
         Self {
             name: name.into(),
             source: ExtractorSource::HeaderRegex,
-            selector,
+            selector: regex.into(),
             header: Some(header.into()),
             required: true,
-            compiled_regex,
-            compiled_json_path: None,
         }
     }
 
@@ -262,8 +211,6 @@ impl Extractor {
             selector: String::new(),
             header: None,
             required: true,
-            compiled_regex: None,
-            compiled_json_path: None,
         }
     }
 
@@ -298,7 +245,7 @@ pub enum BranchOperator {
 }
 
 /// Conditional step execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BranchCondition {
     /// Variable name to inspect.
@@ -307,19 +254,7 @@ pub struct BranchCondition {
     pub operator: BranchOperator,
     /// Expected value for equals / not_equals.
     pub value: Option<String>,
-    /// Compiled regex for [`BranchOperator::MatchesRegex`].
-    pub(crate) compiled_regex: Option<regex::Regex>,
 }
-
-impl PartialEq for BranchCondition {
-    fn eq(&self, other: &Self) -> bool {
-        self.variable == other.variable
-            && self.operator == other.operator
-            && self.value == other.value
-    }
-}
-
-impl Eq for BranchCondition {}
 
 impl BranchCondition {
     /// Create an `exists` branch condition.
@@ -328,7 +263,6 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::Exists,
             value: None,
-            compiled_regex: None,
         }
     }
 
@@ -338,7 +272,6 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::Equals,
             value: Some(value.into()),
-            compiled_regex: None,
         }
     }
 
@@ -348,7 +281,6 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::NotEquals,
             value: Some(value.into()),
-            compiled_regex: None,
         }
     }
 
@@ -358,7 +290,6 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::GreaterThan,
             value: Some(value.into()),
-            compiled_regex: None,
         }
     }
 
@@ -368,7 +299,6 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::GreaterThanOrEqual,
             value: Some(value.into()),
-            compiled_regex: None,
         }
     }
 
@@ -378,7 +308,6 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::LessThan,
             value: Some(value.into()),
-            compiled_regex: None,
         }
     }
 
@@ -388,19 +317,15 @@ impl BranchCondition {
             variable: variable.into(),
             operator: BranchOperator::LessThanOrEqual,
             value: Some(value.into()),
-            compiled_regex: None,
         }
     }
 
     /// Create a regex branch condition.
     pub fn matches_regex<S: Into<String>, V: Into<String>>(variable: S, pattern: V) -> Self {
-        let value = pattern.into();
-        let compiled_regex = regex::Regex::new(&value).ok();
         Self {
             variable: variable.into(),
             operator: BranchOperator::MatchesRegex,
-            value: Some(value),
-            compiled_regex,
+            value: Some(pattern.into()),
         }
     }
 }
@@ -774,14 +699,6 @@ pub struct Scenario {
     /// Steps in this scenario
     pub steps: HashMap<StepId, Step>,
 
-    /// Cached ids of root steps (no dependencies), rebuilt when steps change.
-    /// Used by the engine hot path to avoid rescanning `steps` every DAG pass.
-    pub(crate) root_step_ids: Vec<StepId>,
-
-    /// Reverse adjacency: dependency id → steps that list it in `dependencies`.
-    /// Used to promote waiting dependents in O(out-degree) instead of O(steps).
-    pub(crate) dependents: HashMap<StepId, Vec<StepId>>,
-
     /// Number of virtual users to simulate
     pub virtual_users: u32,
 
@@ -814,8 +731,6 @@ impl Scenario {
             id: id.into(),
             name: name.into(),
             steps: HashMap::new(),
-            root_step_ids: Vec::new(),
-            dependents: HashMap::new(),
             virtual_users: 1,
             duration: Duration::from_secs(60),
             ramp_up: Duration::from_secs(0),
@@ -824,33 +739,6 @@ impl Scenario {
             load_profile: None,
             data_sources: HashMap::new(),
             data_source_base_dir: None,
-        }
-    }
-
-    /// Rebuild root-id and reverse-adjacency caches from `steps`.
-    ///
-    /// Call after any mutation of `steps` that bypasses [`Self::add_step`] / builder
-    /// finalize. Safe to call repeatedly.
-    pub fn rebuild_scheduling_cache(&mut self) {
-        self.root_step_ids.clear();
-        self.dependents.clear();
-
-        for step in self.steps.values() {
-            if step.dependencies.is_empty() {
-                self.root_step_ids.push(step.id.clone());
-            }
-            for dep_id in &step.dependencies {
-                self.dependents
-                    .entry(dep_id.clone())
-                    .or_default()
-                    .push(step.id.clone());
-            }
-        }
-
-        // Stable order keeps ready/reset behavior deterministic across runs.
-        self.root_step_ids.sort_unstable();
-        for children in self.dependents.values_mut() {
-            children.sort_unstable();
         }
     }
 
@@ -867,7 +755,6 @@ impl Scenario {
         }
 
         self.steps.insert(step.id.clone(), step);
-        self.rebuild_scheduling_cache();
         Ok(self)
     }
 
@@ -939,14 +826,6 @@ impl Scenario {
 
     /// Get the root steps (steps with no dependencies)
     pub fn get_root_steps(&self) -> Vec<&Step> {
-        if !self.root_step_ids.is_empty() || self.steps.is_empty() {
-            return self
-                .root_step_ids
-                .iter()
-                .filter_map(|id| self.steps.get(id))
-                .collect();
-        }
-        // Fallback when `steps` was mutated without rebuilding the cache.
         self.steps
             .values()
             .filter(|step| step.dependencies.is_empty())
@@ -1181,9 +1060,8 @@ impl ScenarioBuilder {
     /// non-zero virtual-user count). This is the single point where a
     /// misconfigured scenario — including forward references that never resolve
     /// — is rejected.
-    pub fn build(mut self) -> Result<Scenario> {
+    pub fn build(self) -> Result<Scenario> {
         self.scenario.validate()?;
-        self.scenario.rebuild_scheduling_cache();
         Ok(self.scenario)
     }
 }
@@ -1236,11 +1114,6 @@ mod tests {
         let root_steps = scenario.get_root_steps();
         assert_eq!(root_steps.len(), 1);
         assert_eq!(root_steps[0].id, "step1");
-        assert_eq!(scenario.root_step_ids, vec!["step1".to_string()]);
-        assert_eq!(
-            scenario.dependents.get("step1").map(|d| d.as_slice()),
-            Some(["step2".to_string()].as_slice())
-        );
 
         let leaf_steps = scenario.get_leaf_steps();
         assert_eq!(leaf_steps.len(), 1);
