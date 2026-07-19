@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use rand::RngExt;
+use serde::de::IgnoredAny;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -521,13 +523,22 @@ fn render_request(
             }
             DynamicBodyTemplate::Json(template) => {
                 let rendered = render_template(ctx, &step.id, template)?;
-                let value: serde_json::Value = serde_json::from_str(&rendered).map_err(|e| {
+                // Validate JSON without building a Value we would immediately
+                // re-serialize via RequestBuilder::json (Value → to_vec).
+                serde_json::from_str::<IgnoredAny>(&rendered).map_err(|e| {
                     Error::validation(format!(
                         "Rendered JSON body for step '{}' is invalid: {e}",
                         step.id
                     ))
                 })?;
-                builder = builder.json(&value);
+                let has_content_type = spec
+                    .header_templates
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("content-type"));
+                builder = builder.binary(Bytes::from(rendered));
+                if !has_content_type {
+                    builder = builder.header("Content-Type", "application/json");
+                }
             }
         }
     }
