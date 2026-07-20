@@ -123,9 +123,7 @@ fn bench_http_send_clones(c: &mut Criterion) {
     let request = sample_send_request();
 
     // Engine static path: `step.request.clone()` every attempt.
-    group.bench_function("request_clone", |b| {
-        b.iter(|| black_box(request.clone()))
-    });
+    group.bench_function("request_clone", |b| b.iter(|| black_box(request.clone())));
 
     // Send path only: clones method/URL/headers/body for reqwest.
     group.bench_function("send_materialize", |b| {
