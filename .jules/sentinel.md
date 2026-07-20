@@ -1,0 +1,1 @@
+## 2026-07-20 - [Credential Leakage in Telemetry]\n**Vulnerability:** URL passwords could be leaked in telemetry output.\n**Learning:** The `RequestMetrics::new` function logged the full URL including credentials.\n**Prevention:** Scrub the password using `url.set_password(None)`.
