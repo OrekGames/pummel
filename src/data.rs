@@ -2,13 +2,24 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use dashmap::DashMap;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+
+/// Parsed tokens for relative `{{data.<source>.<path>}}` lookups.
+///
+/// Template paths are static per scenario, so caching avoids `format!("$.…")`
+/// + re-parse on every render/extract.
+fn relative_path_token_cache() -> &'static DashMap<String, Arc<Vec<JsonPathToken>>> {
+    static CACHE: OnceLock<DashMap<String, Arc<Vec<JsonPathToken>>>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
 
 /// External fixture source used by dynamic scenarios.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,13 +506,7 @@ pub(crate) fn validate_json_path(path: &str) -> Result<()> {
 
 /// Validate the relative path used by `{{data.<source>.<path>}}`.
 pub(crate) fn validate_relative_json_path(path: &str) -> Result<()> {
-    if path == "$" || path.starts_with("$.") || path.starts_with("$[") {
-        return validate_json_path(path);
-    }
-    if path.is_empty() {
-        return Err(Error::config("data path cannot be empty"));
-    }
-    validate_json_path(&format!("$.{path}"))
+    parse_relative_json_path(path).map(|_| ())
 }
 
 /// Extract using the documented JSON-path subset.
@@ -515,13 +520,128 @@ pub(crate) fn extract_json_path_tokens(value: &Value, tokens: &[JsonPathToken]) 
     extract_tokens(value, tokens).cloned()
 }
 
-/// Extract from a data row using a relative path.
-pub(crate) fn extract_relative_json_path(value: &Value, path: &str) -> Option<Value> {
+/// Parse a relative data-row path (`field`, `a.b[0]`) or absolute `$…` form.
+///
+/// Relative paths are equivalent to `$.{path}` but parsed without allocating
+/// that intermediate string.
+pub(crate) fn parse_relative_json_path(path: &str) -> Result<Vec<JsonPathToken>> {
     if path == "$" || path.starts_with("$.") || path.starts_with("$[") {
-        return extract_json_path(value, path);
+        return parse_json_path(path);
     }
-    let tokens = parse_json_path(&format!("$.{path}")).ok()?;
+    if path.is_empty() {
+        return Err(Error::config("data path cannot be empty"));
+    }
+    parse_relative_path_body(path)
+}
+
+/// Extract from a data row using a relative path.
+///
+/// Hot path caches parsed tokens per path string so repeated
+/// `{{data.<source>.<path>}}` renders skip `format!` + re-parse.
+///
+/// Exposed for `benches/data_path_benchmarks.rs`. Not part of the stable public API.
+#[doc(hidden)]
+pub fn extract_relative_json_path(value: &Value, path: &str) -> Option<Value> {
+    let tokens = cached_relative_json_path_tokens(path)?;
     extract_json_path_tokens(value, &tokens)
+}
+
+fn cached_relative_json_path_tokens(path: &str) -> Option<Arc<Vec<JsonPathToken>>> {
+    let cache = relative_path_token_cache();
+    if let Some(existing) = cache.get(path) {
+        return Some(Arc::clone(existing.value()));
+    }
+    let tokens = Arc::new(parse_relative_json_path(path).ok()?);
+    cache.insert(path.to_string(), Arc::clone(&tokens));
+    Some(tokens)
+}
+
+/// Parse `field…` / `field[i]…` as if it were `$.{path}` (no String alloc).
+fn parse_relative_path_body(path: &str) -> Result<Vec<JsonPathToken>> {
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    let mut tokens = Vec::new();
+
+    // First segment is a field name (format!("$.{path}") always inserts `$.`).
+    let start = index;
+    while index < bytes.len() && !matches!(bytes[index], b'.' | b'[' | b']') {
+        index += 1;
+    }
+    if start == index {
+        return Err(Error::config(format!(
+            "json path '$.{path}' contains an empty field"
+        )));
+    }
+    let field = &path[start..index];
+    if field.contains('*') || field.contains('?') || field.contains('"') || field.contains('\'') {
+        return Err(Error::config(format!(
+            "json path '$.{path}' uses unsupported field syntax"
+        )));
+    }
+    tokens.push(JsonPathToken::Field(field.to_string()));
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'.' => {
+                index += 1;
+                let start = index;
+                while index < bytes.len() && !matches!(bytes[index], b'.' | b'[' | b']') {
+                    index += 1;
+                }
+                if start == index {
+                    return Err(Error::config(format!(
+                        "json path '$.{path}' contains an empty field"
+                    )));
+                }
+                let field = &path[start..index];
+                if field.contains('*')
+                    || field.contains('?')
+                    || field.contains('"')
+                    || field.contains('\'')
+                {
+                    return Err(Error::config(format!(
+                        "json path '$.{path}' uses unsupported field syntax"
+                    )));
+                }
+                tokens.push(JsonPathToken::Field(field.to_string()));
+            }
+            b'[' => {
+                index += 1;
+                let start = index;
+                while index < bytes.len() && bytes[index] != b']' {
+                    index += 1;
+                }
+                if index >= bytes.len() {
+                    return Err(Error::config(format!(
+                        "json path '$.{path}' has an unclosed index"
+                    )));
+                }
+                let raw_index = &path[start..index];
+                if raw_index.is_empty() || !raw_index.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Err(Error::config(format!(
+                        "json path '$.{path}' only supports non-negative numeric indexes"
+                    )));
+                }
+                let parsed = raw_index.parse::<usize>().map_err(|e| {
+                    Error::config(format!("json path '$.{path}' has an invalid index: {e}"))
+                })?;
+                tokens.push(JsonPathToken::Index(parsed));
+                index += 1;
+            }
+            b']' => {
+                return Err(Error::config(format!(
+                    "json path '$.{path}' has an unopened index"
+                )));
+            }
+            _ => {
+                return Err(Error::config(format!(
+                    "json path '$.{path}' expected '.' or '[' after '$'/segment"
+                )));
+            }
+        }
+    }
+
+    Ok(tokens)
 }
 
 fn extract_tokens<'a>(value: &'a Value, tokens: &[JsonPathToken]) -> Option<&'a Value> {

@@ -46,22 +46,27 @@ impl fmt::Display for Body {
 }
 
 /// HTTP request
+///
+/// Expensive fields are behind [`Arc`] so `Request::clone` (used on every static
+/// step attempt) is a refcount bump rather than deep-copying the URL, header
+/// map, and body. `DefaultHttpClient::send` still materializes owned copies for
+/// reqwest, which requires ownership of those values.
 #[derive(Debug, Clone)]
 pub struct Request {
     /// HTTP method
     method: HttpMethod,
     /// URL
-    url: Url,
+    url: Arc<Url>,
     /// HTTP headers
-    headers: HttpHeaders,
+    headers: Arc<HttpHeaders>,
     /// Request body
-    body: Body,
+    body: Arc<Body>,
     /// Request timeout
     timeout: Duration,
     /// Follow redirects
     follow_redirects: bool,
     /// Custom data associated with this request
-    metadata: HashMap<String, String>,
+    metadata: Arc<HashMap<String, String>>,
 }
 
 impl Request {
@@ -112,17 +117,17 @@ impl Request {
 
     /// Get the URL
     pub fn url(&self) -> &Url {
-        &self.url
+        self.url.as_ref()
     }
 
     /// Get the HTTP headers
     pub fn headers(&self) -> &HttpHeaders {
-        &self.headers
+        self.headers.as_ref()
     }
 
     /// Get the request body
     pub fn body(&self) -> &Body {
-        &self.body
+        self.body.as_ref()
     }
 
     /// Get the request timeout
@@ -137,7 +142,7 @@ impl Request {
 
     /// Get the metadata
     pub fn metadata(&self) -> &HashMap<String, String> {
-        &self.metadata
+        self.metadata.as_ref()
     }
 
     /// Get a metadata value
@@ -296,12 +301,12 @@ impl RequestBuilder {
 
         Ok(Request {
             method: self.method,
-            url,
-            headers: self.headers,
-            body: self.body,
+            url: Arc::new(url),
+            headers: Arc::new(self.headers),
+            body: Arc::new(self.body),
             timeout: self.timeout,
             follow_redirects: self.follow_redirects,
-            metadata: self.metadata,
+            metadata: Arc::new(self.metadata),
         })
     }
 }
@@ -623,16 +628,22 @@ impl HttpClient for DefaultHttpClient {
             &self.client_no_follow
         };
 
-        // Build the reqwest request
+        // Build the reqwest request. Reqwest takes owned Method/Url/HeaderMap/Body,
+        // so we must materialize copies here; `Request`'s Arc fields make the
+        // engine-side `Request::clone` cheap so this is the only deep copy.
         let mut req_builder = client
             .request(request.method().clone(), request.url().clone())
-            .headers(request.headers().clone())
             .timeout(request.timeout());
 
-        // Set the request body
+        if !request.headers().is_empty() {
+            req_builder = req_builder.headers(request.headers().clone());
+        }
+
+        // Set the request body. Prefer a single Bytes copy for text (avoids an
+        // intermediate String clone before reqwest wraps the buffer).
         req_builder = match request.body() {
             Body::Empty => req_builder,
-            Body::Text(text) => req_builder.body(text.clone()),
+            Body::Text(text) => req_builder.body(Bytes::copy_from_slice(text.as_bytes())),
             Body::Json(json) => req_builder.json(json),
             Body::Binary(bytes) => req_builder.body(bytes.clone()),
         };

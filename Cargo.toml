@@ -89,6 +89,10 @@ harness = false
 name = "data_path_benchmarks"
 harness = false
 
+[[bench]]
+name = "template_render_path_benchmarks"
+harness = false
+
 [[bin]]
 name = "pummel"
 path = "src/bin/cli.rs"

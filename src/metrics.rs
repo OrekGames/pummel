@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -8,10 +9,40 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::Result;
 use crate::http::{Body, Request, Response};
 use crate::scenario::{ScenarioId, StepId};
+
+/// Count compact JSON wire bytes without allocating the serialized `String`.
+/// Matches `Value`'s `Display` / `to_string()` length used previously for size.
+fn json_wire_len(value: &Value) -> u64 {
+    struct Counter(u64);
+    impl Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    // `Value` serialization cannot fail for the standard map/list/primitive shapes.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// Response body size in bytes for metrics (no extra copies for text/binary).
+fn response_body_len(body: &Body) -> u64 {
+    match body {
+        Body::Empty => 0,
+        Body::Text(text) => text.len() as u64,
+        Body::Binary(bytes) => bytes.len() as u64,
+        Body::Json(value) => json_wire_len(value),
+    }
+}
 
 /// Metrics for a single HTTP request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,20 +126,20 @@ impl RequestMetrics {
         error: Option<String>,
         elapsed: Duration,
     ) -> Self {
-        let completed_at = chrono::Utc::now();
-        let timestamp = completed_at
-            - chrono::Duration::from_std(elapsed).unwrap_or_else(|_| chrono::Duration::zero());
-        let method = request.method().to_string();
-        let url = request.url().to_string();
+        // Record latency in ms once; derive start time from the same integer so
+        // timestamp math stays consistent with `response_time_ms` and avoids
+        // `Duration::from_std` chrono conversion on every attempt.
         let response_time_ms = elapsed.as_millis() as u64;
+        let completed_at = Utc::now();
+        let timestamp = match i64::try_from(response_time_ms) {
+            Ok(ms) => completed_at - chrono::Duration::milliseconds(ms),
+            Err(_) => completed_at,
+        };
+        // `as_str()` uses the cached serialization / static method name.
+        let method = request.method().as_str().to_string();
+        let url = request.url().as_str().to_string();
 
         let (status_code, success, ttfb_ms, response_size_bytes) = if let Some(resp) = response {
-            let size = match resp.body() {
-                Body::Empty => 0u64,
-                Body::Text(text) => text.len() as u64,
-                Body::Json(value) => value.to_string().len() as u64,
-                Body::Binary(bytes) => bytes.len() as u64,
-            };
             (
                 resp.status().as_u16(),
                 // A response is only a success if the transport-level status is
@@ -117,7 +148,7 @@ impl RequestMetrics {
                 // pollute the success-latency distribution (real elapsed on failure).
                 resp.is_success() && error.is_none(),
                 resp.ttfb().map(|d| d.as_millis() as u64),
-                Some(size),
+                Some(response_body_len(resp.body())),
             )
         } else {
             (0, false, None, None)
@@ -1091,6 +1122,16 @@ mod tests {
         // p90 of ten samples is the 9th (rank 8), not the max (rank 9).
         assert_eq!(rank_index(10, 0.9), 8);
         assert_eq!(rank_index(1, 0.99), 0);
+    }
+
+    #[test]
+    fn test_json_wire_len_matches_to_string() {
+        let value = serde_json::json!({
+            "ok": true,
+            "n": 42,
+            "items": ["a", "b"],
+        });
+        assert_eq!(json_wire_len(&value), value.to_string().len() as u64);
     }
 
     #[tokio::test]
