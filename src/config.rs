@@ -412,8 +412,15 @@ impl Config {
             serde_json::from_str::<serde::de::IgnoredAny>(json)
                 .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
             let mut req = request.text(json.clone());
-            if !config.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"))
-                && !self.global.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"))
+            if !config
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-type"))
+                && !self
+                    .global
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("content-type"))
             {
                 req = req.header("Content-Type", "application/json");
             }
