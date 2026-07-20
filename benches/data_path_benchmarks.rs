@@ -1,8 +1,10 @@
 //! Microbenchmarks for data-path hot costs:
 //! - JSON-path parse-per-extract vs cached tokens
+//! - relative `{{data.*}}` path: format+parse each access vs cached tokens
 //! - deep `Value` clone vs `Arc::clone` for fixture row bind
 //!
-//! Both arms stay permanently so head-to-head comparisons do not need baselines.
+//! Head-to-head arms stay permanently; `library_extract` uses Criterion baselines
+//! when `extract_relative_json_path` is rewritten in place.
 //!
 //! ```text
 //! cargo bench --bench data_path_benchmarks -- --save-baseline before
@@ -13,6 +15,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use pummel::data::extract_relative_json_path;
 use serde_json::{Value, json};
 
 #[derive(Clone)]
@@ -96,6 +99,49 @@ fn bench_json_path_extract(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_relative_json_path_extract(c: &mut Criterion) {
+    let mut group = c.benchmark_group("relative_json_path_extract");
+    group.throughput(Throughput::Elements(1));
+
+    // Relative form used by `{{data.<source>.<path>}}` (not `$`-prefixed).
+    const PATH: &str = "user.roles[1]";
+    let payload = json!({
+        "user": {
+            "id": 42,
+            "roles": ["reader", "admin", "ops"],
+            "meta": {"region": "us-east-1", "tier": "gold"}
+        },
+        "ok": true
+    });
+
+    group.bench_function("parse_each_time", |b| {
+        b.iter(|| {
+            let absolute = format!("$.{}", black_box(PATH));
+            let tokens = parse_json_path(&absolute);
+            let extracted = extract_tokens(black_box(&payload), &tokens).cloned();
+            black_box(extracted)
+        });
+    });
+
+    let cached = parse_json_path(&format!("$.{PATH}"));
+    group.bench_function("cached_tokens", |b| {
+        b.iter(|| {
+            let extracted = extract_tokens(black_box(&payload), black_box(&cached)).cloned();
+            black_box(extracted)
+        });
+    });
+
+    // Production entry point; compare via Criterion baselines when rewritten.
+    group.bench_function("library_extract", |b| {
+        b.iter(|| {
+            let extracted = extract_relative_json_path(black_box(&payload), black_box(PATH));
+            black_box(extracted)
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_fixture_row_bind(c: &mut Criterion) {
     let mut group = c.benchmark_group("fixture_row_bind");
     group.throughput(Throughput::Elements(1));
@@ -128,5 +174,10 @@ fn bench_fixture_row_bind(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_json_path_extract, bench_fixture_row_bind);
+criterion_group!(
+    benches,
+    bench_json_path_extract,
+    bench_relative_json_path_extract,
+    bench_fixture_row_bind
+);
 criterion_main!(benches);

@@ -527,9 +527,14 @@ fn render_request(
                         step.id
                     ))
                 })?;
-                builder = builder
-                    .header("content-type", "application/json")
-                    .text(rendered);
+                let has_content_type = spec
+                    .header_templates
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("content-type"));
+                builder = builder.text(rendered);
+                if !has_content_type {
+                    builder = builder.header("Content-Type", "application/json");
+                }
             }
         }
     }
