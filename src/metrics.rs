@@ -372,11 +372,61 @@ impl Default for TestResults {
     }
 }
 
+/// Compact per-attempt fields for streaming aggregators.
+///
+/// Carries only what [`InMemoryMetricsCollector`] needs to update its bounded
+/// aggregates, so the engine can skip building a full [`RequestMetrics`] when
+/// no telemetry exporter is attached.
+#[derive(Debug, Clone, Copy)]
+pub struct AttemptSummary<'a> {
+    /// Scenario that owns the step.
+    pub scenario_id: &'a str,
+    /// Step that produced the attempt.
+    pub step_id: &'a str,
+    /// Human-readable step name (captured once per aggregate).
+    pub step_name: &'a str,
+    /// Human-readable scenario name (captured once per aggregate).
+    pub scenario_name: &'a str,
+    /// Virtual user that executed the attempt.
+    pub virtual_user_id: u32,
+    /// Whether the attempt succeeded (transport + validation + extractors).
+    pub success: bool,
+    /// Wall-clock time measured around the send attempt.
+    pub elapsed: Duration,
+}
+
 /// Trait for collecting metrics
 #[async_trait]
 pub trait MetricsCollector: Send + Sync {
     /// Record a request
     async fn record_request(&self, metrics: RequestMetrics) -> Result<()>;
+
+    /// Whether this collector persists attempt data.
+    ///
+    /// When `false` and no telemetry exporter is attached, the engine skips
+    /// constructing [`RequestMetrics`] (UUID, URL/method strings, timestamps,
+    /// body-size work) on the send path. [`NoopMetricsCollector`] returns
+    /// `false`.
+    fn records_requests(&self) -> bool {
+        true
+    }
+
+    /// Whether the engine may call [`Self::record_attempt_summary`] instead of
+    /// building a full [`RequestMetrics`].
+    ///
+    /// Telemetry still forces the full path. Default `false` so custom
+    /// collectors keep receiving [`Self::record_request`].
+    fn accepts_attempt_summary(&self) -> bool {
+        false
+    }
+
+    /// Record a compact attempt outcome without a full [`RequestMetrics`] value.
+    ///
+    /// Default is a deterministic no-op. Collectors that return `true` from
+    /// [`Self::accepts_attempt_summary`] must override this.
+    async fn record_attempt_summary(&self, _summary: AttemptSummary<'_>) -> Result<()> {
+        Ok(())
+    }
 
     /// Get metrics for a step
     async fn get_step_metrics(&self, step_id: &StepId) -> Result<Option<StepMetrics>>;
@@ -620,6 +670,32 @@ impl InMemoryMetricsCollector {
         }
     }
 
+    /// Apply one attempt to the streaming aggregate (shared by full and slim paths).
+    #[allow(clippy::too_many_arguments)]
+    fn record_into_aggregate(
+        &self,
+        scenario_id: ScenarioId,
+        step_id: StepId,
+        step_name: String,
+        scenario_name: String,
+        success: bool,
+        latency_ms: u64,
+        started_ms: i64,
+        completed_ms: i64,
+        vu_id: u32,
+    ) {
+        let key = (scenario_id, step_id);
+        let agg = self
+            .steps
+            .entry(key)
+            .or_insert_with(|| Arc::new(StepAggregate::new()))
+            .clone();
+        // Capture the human-readable names once, from the first request seen.
+        agg.step_name.get_or_init(|| step_name);
+        agg.scenario_name.get_or_init(|| scenario_name);
+        agg.record(success, latency_ms, started_ms, completed_ms, vu_id);
+    }
+
     /// Build `StepMetrics` from a single aggregate. Success-only latency stats;
     /// counts include failures.
     fn build_step_metrics(step_id: &StepId, agg: &StepAggregate) -> StepMetrics {
@@ -784,24 +860,51 @@ impl MetricsCollector for InMemoryMetricsCollector {
     async fn record_request(&self, metrics: RequestMetrics) -> Result<()> {
         // Read the primitive fields, then move the owned key strings into the
         // map key so nothing is cloned on the hot path.
-        let success = metrics.success;
         let latency_ms = metrics.response_time_ms;
         let started_ms = metrics.timestamp.timestamp_millis();
         let completed_ms = metrics.completed_at.timestamp_millis();
-        let vu_id = metrics.virtual_user_id;
-        let step_name = metrics.step_name;
-        let scenario_name = metrics.scenario_name;
-        let key = (metrics.scenario_id, metrics.step_id);
+        self.record_into_aggregate(
+            metrics.scenario_id,
+            metrics.step_id,
+            metrics.step_name,
+            metrics.scenario_name,
+            metrics.success,
+            latency_ms,
+            started_ms,
+            completed_ms,
+            metrics.virtual_user_id,
+        );
+        Ok(())
+    }
 
+    fn accepts_attempt_summary(&self) -> bool {
+        true
+    }
+
+    async fn record_attempt_summary(&self, summary: AttemptSummary<'_>) -> Result<()> {
+        let completed_at = Utc::now();
+        let completed_ms = completed_at.timestamp_millis();
+        let started_ms = (completed_at
+            - chrono::Duration::from_std(summary.elapsed)
+                .unwrap_or_else(|_| chrono::Duration::zero()))
+        .timestamp_millis();
+        let key = (summary.scenario_id.to_owned(), summary.step_id.to_owned());
         let agg = self
             .steps
             .entry(key)
             .or_insert_with(|| Arc::new(StepAggregate::new()))
             .clone();
-        // Capture the human-readable names once, from the first request seen.
-        agg.step_name.get_or_init(|| step_name);
-        agg.scenario_name.get_or_init(|| scenario_name);
-        agg.record(success, latency_ms, started_ms, completed_ms, vu_id);
+        // Clone display names only on first insert; later attempts borrow.
+        agg.step_name.get_or_init(|| summary.step_name.to_owned());
+        agg.scenario_name
+            .get_or_init(|| summary.scenario_name.to_owned());
+        agg.record(
+            summary.success,
+            summary.elapsed.as_millis() as u64,
+            started_ms,
+            completed_ms,
+            summary.virtual_user_id,
+        );
         Ok(())
     }
 
@@ -924,8 +1027,9 @@ impl Default for InMemoryMetricsCollector {
 /// Metrics collector that records nothing.
 ///
 /// Installed by the engine when `[metrics] enabled = false`, so a run performs
-/// no aggregation and returns empty [`TestResults`]. Every method is a cheap
-/// deterministic no-op, so it adds no per-request overhead on the hot path.
+/// no aggregation and returns empty [`TestResults`]. Combined with
+/// [`MetricsCollector::records_requests`] returning `false`, the engine skips
+/// constructing [`RequestMetrics`] when no telemetry exporter is attached.
 #[derive(Clone, Default)]
 pub struct NoopMetricsCollector;
 
@@ -940,6 +1044,10 @@ impl NoopMetricsCollector {
 impl MetricsCollector for NoopMetricsCollector {
     async fn record_request(&self, _metrics: RequestMetrics) -> Result<()> {
         Ok(())
+    }
+
+    fn records_requests(&self) -> bool {
+        false
     }
 
     async fn get_step_metrics(&self, _step_id: &StepId) -> Result<Option<StepMetrics>> {
@@ -1024,6 +1132,68 @@ mod tests {
             "items": ["a", "b"],
         });
         assert_eq!(json_wire_len(&value), value.to_string().len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_attempt_summary_matches_full_record_counts() {
+        let full = InMemoryMetricsCollector::new();
+        let slim = InMemoryMetricsCollector::new();
+        let request = Request::get("https://example.com").build().unwrap();
+        let response = Response::new(
+            StatusCode::OK,
+            reqwest::header::HeaderMap::new(),
+            crate::http::Body::Empty,
+            Duration::from_millis(40),
+        );
+        let elapsed = Duration::from_millis(40);
+
+        full.record_request(RequestMetrics::new(
+            "req1".to_string(),
+            "step1".to_string(),
+            "Step 1".to_string(),
+            "scenario1".to_string(),
+            "Scenario 1".to_string(),
+            3,
+            &request,
+            Some(&response),
+            None,
+            elapsed,
+        ))
+        .await
+        .unwrap();
+
+        slim.record_attempt_summary(AttemptSummary {
+            scenario_id: "scenario1",
+            step_id: "step1",
+            step_name: "Step 1",
+            scenario_name: "Scenario 1",
+            virtual_user_id: 3,
+            success: true,
+            elapsed,
+        })
+        .await
+        .unwrap();
+
+        let full_step = full
+            .get_step_metrics(&"step1".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let slim_step = slim
+            .get_step_metrics(&"step1".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full_step.total_requests, slim_step.total_requests);
+        assert_eq!(full_step.successful_requests, slim_step.successful_requests);
+        assert_eq!(full_step.failed_requests, slim_step.failed_requests);
+        assert_eq!(
+            full_step.avg_response_time_ms,
+            slim_step.avg_response_time_ms
+        );
+        assert_eq!(full_step.name, slim_step.name);
+        assert!(full.accepts_attempt_summary());
+        assert!(!NoopMetricsCollector::new().records_requests());
     }
 
     #[tokio::test]

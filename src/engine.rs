@@ -19,7 +19,8 @@ use crate::graph::{DefaultGraphVisualizer, GraphFormat, GraphVisualizer};
 use crate::http::{HttpClient, HttpClientFactory};
 use crate::logging;
 use crate::metrics::{
-    MetricsCollector, MetricsCollectorFactory, RequestMetrics, RunStatus, TestResults,
+    AttemptSummary, MetricsCollector, MetricsCollectorFactory, RequestMetrics, RunStatus,
+    TestResults,
 };
 use crate::scenario::{
     BranchOperator, DynamicBodyTemplate, DynamicRequestSpec, Extractor, ExtractorSource, LoadStage,
@@ -862,9 +863,12 @@ impl VirtualUserContext {
     /// resolves, so dependents are promoted only once their dependency is
     /// actually `Completed`.
     ///
-    /// Per-attempt recording and real-elapsed-on-failure are
-    /// preserved: one `RequestMetrics` is buffered per send attempt and flushed
-    /// to the collector before returning. A record error is logged rather than
+    /// Per-attempt recording and real-elapsed-on-failure are preserved. When a
+    /// telemetry exporter is attached (or a custom collector needs full records),
+    /// one [`RequestMetrics`] is buffered per send attempt and flushed before
+    /// returning. The default in-memory collector without telemetry uses a slim
+    /// [`AttemptSummary`] path instead; with metrics disabled and no telemetry,
+    /// recording is skipped entirely. A record error is logged rather than
     /// propagated so the step still becomes terminal in the caller's status pass
     /// (the Tier-1 no-strand guarantee: every launched step yields exactly one
     /// outcome).
@@ -915,16 +919,30 @@ impl VirtualUserContext {
             }
         }
 
+        // Recording mode for this step:
+        // - full RequestMetrics when telemetry is on, or a custom collector that
+        //   does not accept AttemptSummary
+        // - slim AttemptSummary for the default in-memory collector (no telemetry)
+        // - skip entirely when metrics are disabled (noop) and no telemetry
+        let use_summary =
+            telemetry_exporter.is_none() && metrics_collector.accepts_attempt_summary();
+        let record_full =
+            telemetry_exporter.is_some() || (metrics_collector.records_requests() && !use_summary);
+
         // Base request ID; each attempt gets a unique `-{attempt}` suffix so
-        // every send is a distinct metrics record.
-        let request_id = Uuid::new_v4().to_string();
+        // every send is a distinct metrics record. Only needed on the full path.
+        let request_id = if record_full {
+            Uuid::new_v4().to_string()
+        } else {
+            String::new()
+        };
 
         // Execute the request with retries using exponential backoff. We record
         // ONE metrics record per send attempt: a step that fails twice
         // then succeeds sent three real requests and must report three, so that
-        // throughput, error rate, and target load reflect actual traffic. The
+        // throughput, error rate, and target load reflect actual traffic. Full
         // records are buffered here (bounded by `max_retries + 1`) and flushed
-        // to the collector after the step status is made terminal.
+        // after the retry loop; the slim path records inline.
         let mut attempts: Vec<RequestMetrics> = Vec::new();
         let mut last_error = None;
         let mut response = None;
@@ -1021,7 +1039,11 @@ impl VirtualUserContext {
                 let result = tokio::time::timeout(step.timeout, http_client.send(&request)).await;
                 (attempt_start.elapsed(), result)
             };
-            let attempt_id = format!("{request_id}-{attempt}");
+            let attempt_id = if record_full {
+                format!("{request_id}-{attempt}")
+            } else {
+                String::new()
+            };
 
             match send_result {
                 Ok(Ok(resp)) => {
@@ -1061,19 +1083,35 @@ impl VirtualUserContext {
                     }
                     let attempt_success = validated && error.is_none();
                     // Record this attempt (response present so size/ttfb/status
-                    // are captured) before moving `resp` into `response`.
-                    attempts.push(RequestMetrics::new(
-                        attempt_id,
-                        step.id.clone(),
-                        step.name.clone(),
-                        scenario.id.clone(),
-                        scenario.name.clone(),
-                        vu_id,
-                        &request,
-                        Some(&resp),
-                        error.clone(),
-                        elapsed,
-                    ));
+                    // are captured on the full path) before moving `resp`.
+                    if record_full {
+                        attempts.push(RequestMetrics::new(
+                            attempt_id,
+                            step.id.clone(),
+                            step.name.clone(),
+                            scenario.id.clone(),
+                            scenario.name.clone(),
+                            vu_id,
+                            &request,
+                            Some(&resp),
+                            error.clone(),
+                            elapsed,
+                        ));
+                    } else if use_summary
+                        && let Err(err) = metrics_collector
+                            .record_attempt_summary(AttemptSummary {
+                                scenario_id: &scenario.id,
+                                step_id: &step.id,
+                                step_name: &step.name,
+                                scenario_name: &scenario.name,
+                                virtual_user_id: vu_id,
+                                success: attempt_success,
+                                elapsed,
+                            })
+                            .await
+                    {
+                        logging::error!("Failed to record metrics for step '{step_id}': {err}");
+                    }
 
                     if attempt_success {
                         response = Some(resp);
@@ -1089,18 +1127,36 @@ impl VirtualUserContext {
                 }
                 Ok(Err(err)) => {
                     // Transport error: no response, but real elapsed is recorded.
-                    attempts.push(RequestMetrics::new(
-                        attempt_id,
-                        step.id.clone(),
-                        step.name.clone(),
-                        scenario.id.clone(),
-                        scenario.name.clone(),
-                        vu_id,
-                        &request,
-                        None,
-                        Some(err.to_string()),
-                        elapsed,
-                    ));
+                    if record_full {
+                        attempts.push(RequestMetrics::new(
+                            attempt_id,
+                            step.id.clone(),
+                            step.name.clone(),
+                            scenario.id.clone(),
+                            scenario.name.clone(),
+                            vu_id,
+                            &request,
+                            None,
+                            Some(err.to_string()),
+                            elapsed,
+                        ));
+                    } else if use_summary
+                        && let Err(record_err) = metrics_collector
+                            .record_attempt_summary(AttemptSummary {
+                                scenario_id: &scenario.id,
+                                step_id: &step.id,
+                                step_name: &step.name,
+                                scenario_name: &scenario.name,
+                                virtual_user_id: vu_id,
+                                success: false,
+                                elapsed,
+                            })
+                            .await
+                    {
+                        logging::error!(
+                            "Failed to record metrics for step '{step_id}': {record_err}"
+                        );
+                    }
                     last_error = Some(err);
                 }
                 Err(_elapsed) => {
@@ -1108,39 +1164,58 @@ impl VirtualUserContext {
                     // with real elapsed (~= step.timeout) and status 0, then let
                     // the retry loop treat it like any other failure.
                     let msg = format!("step '{}' timed out after {:?}", step.id, step.timeout);
-                    attempts.push(RequestMetrics::new(
-                        attempt_id,
-                        step.id.clone(),
-                        step.name.clone(),
-                        scenario.id.clone(),
-                        scenario.name.clone(),
-                        vu_id,
-                        &request,
-                        None,
-                        Some(msg.clone()),
-                        elapsed,
-                    ));
+                    if record_full {
+                        attempts.push(RequestMetrics::new(
+                            attempt_id,
+                            step.id.clone(),
+                            step.name.clone(),
+                            scenario.id.clone(),
+                            scenario.name.clone(),
+                            vu_id,
+                            &request,
+                            None,
+                            Some(msg.clone()),
+                            elapsed,
+                        ));
+                    } else if use_summary
+                        && let Err(err) = metrics_collector
+                            .record_attempt_summary(AttemptSummary {
+                                scenario_id: &scenario.id,
+                                step_id: &step.id,
+                                step_name: &step.name,
+                                scenario_name: &scenario.name,
+                                virtual_user_id: vu_id,
+                                success: false,
+                                elapsed,
+                            })
+                            .await
+                    {
+                        logging::error!("Failed to record metrics for step '{step_id}': {err}");
+                    }
                     last_error = Some(Error::timeout(msg));
                 }
             }
         }
 
-        // Flush one record per attempt (moved into the collector, no clones). A
-        // record error is logged rather than propagated: the caller applies the
+        // Flush full records (telemetry / custom collectors). Slim-summary
+        // attempts were already recorded inline; the noop path recorded nothing.
+        // A record error is logged rather than propagated: the caller applies the
         // terminal status update from the returned outcome regardless, so a
         // failed record can never strand the step (Tier-1 no-strand guarantee).
         let success = response.is_some();
-        for metrics in attempts {
-            // Fire the telemetry callback (if an exporter is attached) BEFORE
-            // moving the record into the collector. Log-and-continue on error,
-            // mirroring the record_request no-strand guarantee.
-            if let Some(exporter) = &telemetry_exporter
-                && let Err(err) = exporter.export_request(&metrics).await
-            {
-                logging::error!("Failed to export telemetry for step '{step_id}': {err}");
-            }
-            if let Err(err) = metrics_collector.record_request(metrics).await {
-                logging::error!("Failed to record metrics for step '{step_id}': {err}");
+        if record_full {
+            for metrics in attempts {
+                // Fire the telemetry callback (if an exporter is attached) BEFORE
+                // moving the record into the collector. Log-and-continue on error,
+                // mirroring the record_request no-strand guarantee.
+                if let Some(exporter) = &telemetry_exporter
+                    && let Err(err) = exporter.export_request(&metrics).await
+                {
+                    logging::error!("Failed to export telemetry for step '{step_id}': {err}");
+                }
+                if let Err(err) = metrics_collector.record_request(metrics).await {
+                    logging::error!("Failed to record metrics for step '{step_id}': {err}");
+                }
             }
         }
 
