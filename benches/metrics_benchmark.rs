@@ -300,7 +300,9 @@ fn bench_request_metrics_construct(c: &mut Criterion) {
     group.sample_size(50);
     group.measurement_time(Duration::from_secs(3));
 
-    let request = Request::get("https://localhost/api/v1/items?limit=50").build().unwrap();
+    let request = Request::get("https://localhost/api/v1/items?limit=50")
+        .build()
+        .unwrap();
     let elapsed = Duration::from_millis(42);
     let id = "req-00000000-0000-0000-0000-000000000001";
     let step_id = "step_1";
