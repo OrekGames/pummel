@@ -1,0 +1,28 @@
+--- src/config.rs
++++ src/config.rs
+@@ -236,7 +236,7 @@
+             if let Some(json) = &step.json {
+                 validate_template(&format!("steps.{step_id}.json"), json)?;
+                 if !contains_template(json) {
+-                    serde_json::from_str::<serde_json::Value>(json).map_err(|e| {
++                    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|e| {
+                         Error::config(format!("Invalid JSON for step '{step_id}': {e}"))
+                     })?;
+                 }
+@@ -408,9 +408,12 @@
+         } else if let Some(body) = &config.body {
+             request.text(body)
+         } else if let Some(json) = &config.json {
+-            // Parse the JSON string into a serde_json::Value
+-            let json_value: serde_json::Value = serde_json::from_str(json)
+-                .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
+-            request.json(&json_value)
++            let has_content_type = self.global.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"))
++                || config.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
++            let mut req = request.binary(bytes::Bytes::from(json.clone()));
++            if !has_content_type {
++                req = req.header("content-type", "application/json");
++            }
++            req
+         } else {
+             request

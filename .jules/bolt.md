@@ -1,0 +1,3 @@
+## 2024-07-21 - Avoiding Unnecessary JSON Parsing in Configuration
+**Learning:** During configuration loading, pre-rendered JSON strings were previously parsed into full `serde_json::Value` objects just to be reserialized via `request.json()`. This is unnecessary when the string is already a valid JSON string (which we can validate without building the AST via `serde::de::IgnoredAny`).
+**Action:** Replace `serde_json::from_str::<serde_json::Value>` with `serde_json::from_str::<serde::de::IgnoredAny>` for validation where we don't need the parsed structure, and use `request.binary(Bytes::from(json.clone()))` plus setting the `content-type` header directly instead of relying on `request.json()` to avoid the parse-and-serialize roundtrip.
