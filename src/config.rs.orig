@@ -236,7 +236,7 @@ impl Config {
             if let Some(json) = &step.json {
                 validate_template(&format!("steps.{step_id}.json"), json)?;
                 if !contains_template(json) {
-                    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|e| {
+                    serde_json::from_str::<serde_json::Value>(json).map_err(|e| {
                         Error::config(format!("Invalid JSON for step '{step_id}': {e}"))
                     })?;
                 }
@@ -408,13 +408,10 @@ impl Config {
         } else if let Some(body) = &config.body {
             request.text(body)
         } else if let Some(json) = &config.json {
-            let has_content_type = self.global.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"))
-                || config.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
-            let mut req = request.binary(bytes::Bytes::from(json.clone()));
-            if !has_content_type {
-                req = req.header("content-type", "application/json");
-            }
-            req
+            // Parse the JSON string into a serde_json::Value
+            let json_value: serde_json::Value = serde_json::from_str(json)
+                .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
+            request.json(&json_value)
         } else {
             request
         };
@@ -1740,12 +1737,12 @@ mod tests {
             [global]
             base_url = "https://example.com"
             virtual_users = 10
-            
+
             [scenarios.login]
             name = "Login Scenario"
             steps = ["login"]
             virtual_users = 5
-            
+
             [steps.login]
             name = "Login Step"
             method = "POST"
@@ -1778,17 +1775,17 @@ mod tests {
         let toml_str = r#"
             [global]
             base_url = "https://example.com"
-            
+
             [scenarios.simple]
             name = "Simple Scenario"
             steps = ["step1", "step2"]
             virtual_users = 5
-            
+
             [steps.step1]
             name = "Step 1"
             method = "GET"
             url = "/api/resource"
-            
+
             [steps.step2]
             name = "Step 2"
             method = "POST"
