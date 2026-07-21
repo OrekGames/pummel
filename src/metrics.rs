@@ -137,7 +137,9 @@ impl RequestMetrics {
         };
         // `as_str()` uses the cached serialization / static method name.
         let method = request.method().as_str().to_string();
-        let url = request.url().as_str().to_string();
+        let mut parsed_url = request.url().clone();
+        let _ = parsed_url.set_password(None);
+        let url = parsed_url.as_str().to_string();
 
         let (status_code, success, ttfb_ms, response_size_bytes) = if let Some(resp) = response {
             (
