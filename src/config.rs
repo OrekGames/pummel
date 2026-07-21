@@ -408,8 +408,15 @@ impl Config {
         } else if let Some(body) = &config.body {
             request.text(body)
         } else if let Some(json) = &config.json {
-            let has_content_type = self.global.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"))
-                || config.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
+            let has_content_type = self
+                .global
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-type"))
+                || config
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("content-type"));
             let mut req = request.binary(bytes::Bytes::from(json.clone()));
             if !has_content_type {
                 req = req.header("content-type", "application/json");
