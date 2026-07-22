@@ -137,7 +137,11 @@ impl RequestMetrics {
         };
         // `as_str()` uses the cached serialization / static method name.
         let method = request.method().as_str().to_string();
-        let url = request.url().as_str().to_string();
+
+        // Redact any password in the URL before recording it in metrics
+        let mut redacted_url = request.url().clone();
+        let _ = redacted_url.set_password(None);
+        let url = redacted_url.as_str().to_string();
 
         let (status_code, success, ttfb_ms, response_size_bytes) = if let Some(resp) = response {
             (
