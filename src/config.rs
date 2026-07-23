@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use reqwest::{Method, Url, header};
-use serde::{Deserialize, Serialize};
 use serde::de::IgnoredAny;
+use serde::{Deserialize, Serialize};
 use serde_yaml_ng as serde_yaml;
 use toml;
 
@@ -415,8 +415,15 @@ impl Config {
                 .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
 
             // Set the Content-Type header if not already present
-            let has_content_type = self.global.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"))
-                || config.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
+            let has_content_type = self
+                .global
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-type"))
+                || config
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("content-type"));
 
             let mut req = request.binary(Bytes::from(json.clone()));
             if !has_content_type {
