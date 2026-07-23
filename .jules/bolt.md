@@ -1,0 +1,3 @@
+## 2024-05-24 - Pre-rendered JSON Request Bodies
+**Learning:** Sending pre-rendered JSON strings in HTTP requests by parsing them into `serde_json::Value` and passing them to `.json()` (which reserializes them) introduces unnecessary parse-and-serialize roundtrips and deep copies.
+**Action:** Use `request.binary(bytes::Bytes::from(json.clone()))` along with a manually set `content-type` header instead. `Bytes::from(String)` is an O(1) operation that avoids allocation overhead when cloning repeatedly on hot paths. For validation on hot paths, use `serde_json::from_str::<serde::de::IgnoredAny>` instead of fully deserializing the payload into a syntax tree.

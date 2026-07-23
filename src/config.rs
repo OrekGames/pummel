@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use bytes::Bytes;
 use reqwest::{Method, Url, header};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng as serde_yaml;
 use toml;
@@ -408,10 +410,26 @@ impl Config {
         } else if let Some(body) = &config.body {
             request.text(body)
         } else if let Some(json) = &config.json {
-            // Parse the JSON string into a serde_json::Value
-            let json_value: serde_json::Value = serde_json::from_str(json)
+            // Validate the JSON without allocating a syntax tree
+            serde_json::from_str::<IgnoredAny>(json)
                 .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
-            request.json(&json_value)
+
+            // Set the Content-Type header if not already present
+            let has_content_type = self
+                .global
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-type"))
+                || config
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("content-type"));
+
+            let mut req = request.binary(Bytes::from(json.clone()));
+            if !has_content_type {
+                req = req.header("content-type", "application/json");
+            }
+            req
         } else {
             request
         };
