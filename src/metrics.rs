@@ -137,7 +137,13 @@ impl RequestMetrics {
         };
         // `as_str()` uses the cached serialization / static method name.
         let method = request.method().as_str().to_string();
-        let url = request.url().as_str().to_string();
+        let url = if request.url().password().is_some() {
+            let mut redacted_url = request.url().clone();
+            let _ = redacted_url.set_password(None);
+            redacted_url.as_str().to_string()
+        } else {
+            request.url().as_str().to_string()
+        };
 
         let (status_code, success, ttfb_ms, response_size_bytes) = if let Some(resp) = response {
             (
@@ -1024,6 +1030,24 @@ mod tests {
             "items": ["a", "b"],
         });
         assert_eq!(json_wire_len(&value), value.to_string().len() as u64);
+    }
+
+    #[test]
+    fn test_url_password_redaction() {
+        let request = Request::get("https://user:secret@example.com/api").build().unwrap();
+        let metrics = RequestMetrics::new(
+            "req1".to_string(),
+            "step1".to_string(),
+            "Step 1".to_string(),
+            "scenario1".to_string(),
+            "Scenario 1".to_string(),
+            1,
+            &request,
+            None,
+            None,
+            Duration::from_millis(100),
+        );
+        assert_eq!(metrics.url, "https://user@example.com/api");
     }
 
     #[tokio::test]
