@@ -408,10 +408,19 @@ impl Config {
         } else if let Some(body) = &config.body {
             request.text(body)
         } else if let Some(json) = &config.json {
-            // Parse the JSON string into a serde_json::Value
-            let json_value: serde_json::Value = serde_json::from_str(json)
+            // Validate JSON without building a Value tree
+            serde_json::from_str::<serde::de::IgnoredAny>(json)
                 .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
-            request.json(&json_value)
+            let has_content_type = config
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-type"))
+                || self.global.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
+            let mut req = request.binary(bytes::Bytes::from(json.clone()));
+            if !has_content_type {
+                req = req.header("Content-Type", "application/json");
+            }
+            req
         } else {
             request
         };
