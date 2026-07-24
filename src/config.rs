@@ -415,7 +415,11 @@ impl Config {
                 .headers
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("content-type"))
-                || self.global.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
+                || self
+                    .global
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("content-type"));
             let mut req = request.binary(bytes::Bytes::from(json.clone()));
             if !has_content_type {
                 req = req.header("Content-Type", "application/json");
