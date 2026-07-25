@@ -411,7 +411,8 @@ impl Config {
             // Validate the JSON string
             serde_json::from_str::<serde::de::IgnoredAny>(json)
                 .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
-            request.header(header::CONTENT_TYPE.as_str(), "application/json")
+            request
+                .header(header::CONTENT_TYPE.as_str(), "application/json")
                 .binary(bytes::Bytes::from(json.clone()))
         } else {
             request
