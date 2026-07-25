@@ -137,7 +137,9 @@ impl RequestMetrics {
         };
         // `as_str()` uses the cached serialization / static method name.
         let method = request.method().as_str().to_string();
-        let url = request.url().as_str().to_string();
+        let mut url_clone = request.url().clone();
+        let _ = url_clone.set_password(None);
+        let url = url_clone.as_str().to_string();
 
         let (status_code, success, ttfb_ms, response_size_bytes) = if let Some(resp) = response {
             (
@@ -987,6 +989,24 @@ mod tests {
     use crate::http::{Request, Response};
     use reqwest::StatusCode;
     use std::time::Duration;
+
+    #[test]
+    fn test_request_metrics_redacts_password() {
+        let request = Request::get("https://user:secret@example.com/api").build().unwrap();
+        let metrics = RequestMetrics::new(
+            "req1".to_string(),
+            "step1".to_string(),
+            "Step 1".to_string(),
+            "scen1".to_string(),
+            "Scenario 1".to_string(),
+            1,
+            &request,
+            None,
+            None,
+            Duration::from_millis(50),
+        );
+        assert_eq!(metrics.url, "https://user@example.com/api");
+    }
 
     #[test]
     fn test_bucket_mapping_is_monotonic_and_bounded() {

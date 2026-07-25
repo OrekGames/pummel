@@ -1,0 +1,4 @@
+## 2024-05-01 - Prevent Credential Leakage in Logs and Telemetry
+**Vulnerability:** Embedded HTTP basic auth credentials in request URLs (e.g. `https://user:pass@example.com`) were logged and emitted in telemetry in plain text by `RequestMetrics`. This could leak sensitive secrets in log files, standard output, and metrics stores.
+**Learning:** `reqwest::Url` parses credentials natively, meaning `url.as_str()` retains them. To prevent leakage, credentials must be actively removed (redacted) before serializing the URL for logging or metrics. The memory prompt mentions: "When logging or recording telemetry using `reqwest::Url` objects, ensure embedded passwords are redacted (e.g., via `url.set_password(None)`) to prevent credential leakage in metrics and console outputs."
+**Prevention:** Scrub the password (and potentially the username depending on the threat model, but definitely password) from URLs before including them in metrics structs or log outputs.
