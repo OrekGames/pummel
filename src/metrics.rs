@@ -992,7 +992,9 @@ mod tests {
 
     #[test]
     fn test_request_metrics_redacts_password() {
-        let request = Request::get("https://user:secret@example.com/api").build().unwrap();
+        let request = Request::get("https://user:secret@example.com/api")
+            .build()
+            .unwrap();
         let metrics = RequestMetrics::new(
             "req1".to_string(),
             "step1".to_string(),
