@@ -48,4 +48,5 @@ Thumbs.db
 .cursor/
 .claude/
 .agents/
+.jules/
 *.ai.log
