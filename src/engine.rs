@@ -720,11 +720,7 @@ struct VirtualUserContext {
 
 impl VirtualUserContext {
     /// Create a new virtual user context
-    fn new(
-        id: u32,
-        scenario: Arc<Scenario>,
-        shared_state: SharedEngineState,
-    ) -> Self {
+    fn new(id: u32, scenario: Arc<Scenario>, shared_state: SharedEngineState) -> Self {
         let mut step_statuses = HashMap::new();
 
         // Initialize all steps as waiting
@@ -1682,11 +1678,7 @@ impl Engine {
                 };
 
                 // Create a virtual user context
-                let mut context = VirtualUserContext::new(
-                    i,
-                    scenario_clone,
-                    shared_state,
-                );
+                let mut context = VirtualUserContext::new(i, scenario_clone, shared_state);
 
                 context.run(deadline).await
             });
