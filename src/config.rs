@@ -1731,14 +1731,10 @@ mod tests {
 
     #[test]
     fn test_config_builder_virtual_users() {
-        let config1 = ConfigBuilder::new()
-            .virtual_users(42)
-            .build();
+        let config1 = ConfigBuilder::new().virtual_users(42).build();
         assert_eq!(config1.global.virtual_users, 42);
 
-        let config2 = ConfigBuilder::new()
-            .virtual_users(0)
-            .build();
+        let config2 = ConfigBuilder::new().virtual_users(0).build();
         assert_eq!(config2.global.virtual_users, 0);
     }
 
