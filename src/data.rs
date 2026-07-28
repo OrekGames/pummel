@@ -771,3 +771,36 @@ fn splitmix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_csv_data_source_creation() {
+        let path = "test_path.csv";
+        let source = DataSource::csv(path);
+
+        assert_eq!(source.kind, DataSourceKind::Csv);
+        assert_eq!(source.path, path);
+        assert_eq!(source.root, None);
+        assert_eq!(source.access, DataAccessMode::default());
+        assert_eq!(source.exhaustion, DataExhaustion::default());
+        assert_eq!(source.seed, None);
+        assert!(source.columns.is_empty());
+    }
+
+    #[test]
+    fn test_json_data_source_creation() {
+        let path = "test_path.json";
+        let source = DataSource::json(path);
+
+        assert_eq!(source.kind, DataSourceKind::Json);
+        assert_eq!(source.path, path);
+        assert_eq!(source.root, None);
+        assert_eq!(source.access, DataAccessMode::default());
+        assert_eq!(source.exhaustion, DataExhaustion::default());
+        assert_eq!(source.seed, None);
+        assert!(source.columns.is_empty());
+    }
+}
