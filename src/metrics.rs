@@ -80,7 +80,12 @@ pub struct RequestMetrics {
     /// HTTP status code
     pub status_code: u16,
 
-    /// Whether the request was successful
+    /// Whether the attempt succeeded at the scenario level.
+    ///
+    /// This follows step validation and extractors (no recorded `error`), not
+    /// raw HTTP 2xx. A custom validator that accepts a non-2xx response is a
+    /// success; a 2xx that fails validation is a failure. HTTP status remains
+    /// available in [`Self::status_code`].
     pub success: bool,
 
     /// Response time in milliseconds
@@ -146,11 +151,12 @@ impl RequestMetrics {
         let (status_code, success, ttfb_ms, response_size_bytes) = if let Some(resp) = response {
             (
                 resp.status().as_u16(),
-                // A response is only a success if the transport-level status is
-                // successful AND no error (e.g. a custom validator rejection)
-                // was recorded. Otherwise a 2xx that fails validation would
-                // pollute the success-latency distribution (real elapsed on failure).
-                resp.is_success() && error.is_none(),
+                // Scenario-level success: no validation/extractor error. Matches
+                // engine `attempt_success` / slim [`AttemptSummary`] so custom
+                // validators that accept non-2xx count as successes, while a
+                // 2xx that fails validation still fails (and does not pollute
+                // success-only latency).
+                error.is_none(),
                 resp.ttfb().map(|d| d.as_millis() as u64),
                 Some(response_body_len(resp.body())),
             )
@@ -1444,6 +1450,64 @@ mod tests {
         assert_eq!(step.successful_requests, 0);
         assert_eq!(step.failed_requests, 1);
         assert_eq!(step.error_rate, 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_custom_validator_accepting_non_2xx_counts_as_success() {
+        // Engine passes error=None when step.validate() accepts the response,
+        // even for non-2xx. Full RequestMetrics must agree with AttemptSummary
+        // so telemetry and default aggregates share success semantics.
+        let collector = InMemoryMetricsCollector::new();
+        let request = Request::get("https://example.com/missing").build().unwrap();
+        let not_found = Response::new(
+            StatusCode::NOT_FOUND,
+            reqwest::header::HeaderMap::new(),
+            crate::http::Body::Empty,
+            Duration::from_millis(40),
+        );
+        let elapsed = Duration::from_millis(40);
+
+        let full = RequestMetrics::new(
+            "accepted-404".to_string(),
+            "step1".to_string(),
+            "Step 1".to_string(),
+            "scenario1".to_string(),
+            "Scenario 1".to_string(),
+            0,
+            &request,
+            Some(&not_found),
+            None,
+            elapsed,
+        );
+        assert!(
+            full.success,
+            "non-2xx with no scenario error must count as success"
+        );
+        assert_eq!(full.status_code, 404);
+
+        collector.record_request(full).await.unwrap();
+        collector
+            .record_attempt_summary(AttemptSummary {
+                scenario_id: "scenario1",
+                step_id: "step1",
+                step_name: "Step 1",
+                scenario_name: "Scenario 1",
+                virtual_user_id: 0,
+                success: true,
+                elapsed,
+            })
+            .await
+            .unwrap();
+
+        let step = collector
+            .get_step_metrics(&"step1".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(step.total_requests, 2);
+        assert_eq!(step.successful_requests, 2);
+        assert_eq!(step.failed_requests, 0);
+        assert_eq!(step.avg_response_time_ms, 40.0);
     }
 
     #[tokio::test]
