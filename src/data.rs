@@ -641,10 +641,9 @@ fn parse_json_path_segments(
 fn parse_relative_path_body(path: &str) -> Result<Vec<JsonPathToken>> {
     let bytes = path.as_bytes();
     let mut index = 0;
-    let mut tokens = Vec::new();
 
     // First segment is a field name (format!("$.{path}") always inserts `$.`).
-    tokens.push(parse_json_path_field(path, bytes, &mut index, true)?);
+    let tokens = vec![parse_json_path_field(path, bytes, &mut index, true)?];
     parse_json_path_segments(path, bytes, index, true, tokens)
 }
 
