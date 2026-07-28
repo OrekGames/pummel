@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::{Method, Url, header};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng as serde_yaml;
 use toml;
@@ -236,7 +237,7 @@ impl Config {
             if let Some(json) = &step.json {
                 validate_template(&format!("steps.{step_id}.json"), json)?;
                 if !contains_template(json) {
-                    serde_json::from_str::<serde_json::Value>(json).map_err(|e| {
+                    serde_json::from_str::<IgnoredAny>(json).map_err(|e| {
                         Error::config(format!("Invalid JSON for step '{step_id}': {e}"))
                     })?;
                 }
@@ -408,10 +409,22 @@ impl Config {
         } else if let Some(body) = &config.body {
             request.text(body)
         } else if let Some(json) = &config.json {
-            // Parse the JSON string into a serde_json::Value
-            let json_value: serde_json::Value = serde_json::from_str(json)
-                .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
-            request.json(&json_value)
+            let has_content_type = config
+                .headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("content-type"))
+                || (!needs_dynamic
+                    && self
+                        .global
+                        .headers
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case("content-type")));
+            let request = request.binary(bytes::Bytes::from(json.clone()));
+            if !has_content_type {
+                request.header("Content-Type", "application/json")
+            } else {
+                request
+            }
         } else {
             request
         };
