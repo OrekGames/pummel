@@ -60,6 +60,7 @@ uuid = { version = "1.17", features = ["v4"] }
 
 # Dynamic scenario extractors
 regex = "1"
+lru = "0.18.1"
 
 [dev-dependencies]
 tempfile = "3.8"

@@ -1,7 +1,11 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use lru::LruCache;
 
 use bytes::Bytes;
 use rand::RngExt;
@@ -437,9 +441,26 @@ fn branch_matches(
                 if let Some(regex) = branch.compiled_regex.as_ref() {
                     regex.is_match(&haystack)
                 } else if let Some(pattern) = &branch.value {
-                    regex::Regex::new(pattern)
-                        .map(|regex| regex.is_match(&haystack))
-                        .unwrap_or(false)
+                    thread_local! {
+                        static REGEX_CACHE: RefCell<LruCache<String, regex::Regex>> = RefCell::new(
+                            LruCache::new(NonZeroUsize::new(1000).unwrap())
+                        );
+                    }
+
+                    REGEX_CACHE.with(|cache| {
+                        let mut cache = cache.borrow_mut();
+                        if let Some(regex) = cache.get(pattern) {
+                            return regex.is_match(&haystack);
+                        }
+
+                        if let Ok(regex) = regex::Regex::new(pattern) {
+                            let is_match = regex.is_match(&haystack);
+                            cache.put(pattern.clone(), regex);
+                            is_match
+                        } else {
+                            false
+                        }
+                    })
                 } else {
                     false
                 }
