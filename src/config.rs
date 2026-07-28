@@ -2229,14 +2229,15 @@ global:
         // Note: The dynamic lint report actually validates data source ID and basic
         // structure. However, it also tries to load the source.
         // Let's create a temporary file.
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let mut tmp_file = NamedTempFile::new().unwrap();
         writeln!(tmp_file, "id,name\n1,Alice").unwrap();
         let tmp_path = tmp_file.path().to_str().unwrap().replace('\\', "/");
 
-        let toml_str = format!(r#"
+        let toml_str = format!(
+            r#"
             [global]
             base_url = "https://example.com"
 
@@ -2266,7 +2267,9 @@ global:
             [steps.step2.branch]
             variable = "token"
             condition = "exists"
-        "#, tmp_path);
+        "#,
+            tmp_path
+        );
         let config = Config::from_toml_str(&toml_str).unwrap();
         let report = config.dynamic_lint_report().unwrap();
         assert_eq!(report.data_sources, 1);
