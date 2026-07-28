@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use std::num::NonZeroUsize;
 
 use bytes::Bytes;
 use lru::LruCache;
