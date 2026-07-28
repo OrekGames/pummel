@@ -1736,14 +1736,10 @@ mod tests {
             .build();
         assert_eq!(config.global.timeout_ms, 500);
 
-        let config = ConfigBuilder::new()
-            .timeout(Duration::from_secs(3))
-            .build();
+        let config = ConfigBuilder::new().timeout(Duration::from_secs(3)).build();
         assert_eq!(config.global.timeout_ms, 3000);
 
-        let config = ConfigBuilder::new()
-            .timeout(Duration::from_secs(0))
-            .build();
+        let config = ConfigBuilder::new().timeout(Duration::from_secs(0)).build();
         assert_eq!(config.global.timeout_ms, 0);
     }
 
