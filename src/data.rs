@@ -771,3 +771,20 @@ fn splitmix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_data_source_seed() {
+        let source = DataSource::csv("test.csv").seed(12345);
+        assert_eq!(source.seed, Some(12345));
+
+        let source2 = DataSource::json("test.json").seed(999);
+        assert_eq!(source2.seed, Some(999));
+        assert_eq!(source2.kind, DataSourceKind::Json);
+        assert_eq!(source2.path, "test.json");
+    }
+}
