@@ -771,3 +771,20 @@ fn splitmix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_csv() {
+        let source = DataSource::csv("test.csv");
+        assert_eq!(source.kind, DataSourceKind::Csv);
+        assert_eq!(source.path, "test.csv");
+        assert_eq!(source.root, None);
+        assert_eq!(source.access, DataAccessMode::default());
+        assert_eq!(source.exhaustion, DataExhaustion::default());
+        assert_eq!(source.seed, None);
+        assert!(source.columns.is_empty());
+    }
+}
