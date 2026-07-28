@@ -709,6 +709,7 @@ impl VirtualUserContext {
         data_sources: Arc<LoadedDataSources>,
     ) -> Self {
         let mut step_statuses = HashMap::new();
+        let mut ready_buf = Vec::new();
 
         // Initialize all steps as waiting
         for step in scenario.get_steps() {
@@ -718,6 +719,7 @@ impl VirtualUserContext {
         // Mark steps with no dependencies as ready
         for step in scenario.get_root_steps() {
             step_statuses.insert(step.id.clone(), StepStatus::Ready);
+            ready_buf.push(step.id.clone());
         }
 
         Self {
@@ -727,7 +729,7 @@ impl VirtualUserContext {
             metrics_collector,
             telemetry_exporter,
             step_statuses,
-            ready_buf: Vec::new(),
+            ready_buf,
             options,
             semaphore,
             rate_limiter,
@@ -749,9 +751,11 @@ impl VirtualUserContext {
         for status in self.step_statuses.values_mut() {
             *status = StepStatus::Waiting;
         }
+        self.ready_buf.clear();
         for step_id in &self.scenario.root_step_ids {
             if let Some(status) = self.step_statuses.get_mut(step_id) {
                 *status = StepStatus::Ready;
+                self.ready_buf.push(step_id.clone());
             }
         }
     }
@@ -769,16 +773,6 @@ impl VirtualUserContext {
     /// rather than `&Step` so the caller can drop the `self` borrow before the
     /// concurrent sends.
     fn take_ready_steps(&mut self) -> Vec<StepId> {
-        self.ready_buf.clear();
-
-        // Walk statuses (typically fewer Ready entries than total steps in deep
-        // DAGs) instead of scanning every scenario step.
-        for (step_id, status) in &self.step_statuses {
-            if matches!(status, StepStatus::Ready) {
-                self.ready_buf.push(step_id.clone());
-            }
-        }
-
         self.ready_buf.sort_unstable_by(|a, b| {
             let wa = self
                 .scenario
@@ -847,6 +841,7 @@ impl VirtualUserContext {
                 && let Some(status) = self.step_statuses.get_mut(&dep_step_id)
             {
                 *status = StepStatus::Ready;
+                self.ready_buf.push(dep_step_id.clone());
             }
         }
     }
