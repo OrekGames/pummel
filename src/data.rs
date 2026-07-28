@@ -557,53 +557,45 @@ fn cached_relative_json_path_tokens(path: &str) -> Option<Arc<Vec<JsonPathToken>
 }
 
 /// Parse `field…` / `field[i]…` as if it were `$.{path}` (no String alloc).
-fn parse_relative_path_body(path: &str) -> Result<Vec<JsonPathToken>> {
-    let bytes = path.as_bytes();
-    let mut index = 0;
-    let mut tokens = Vec::new();
-
-    // First segment is a field name (format!("$.{path}") always inserts `$.`).
-    let start = index;
-    while index < bytes.len() && !matches!(bytes[index], b'.' | b'[' | b']') {
-        index += 1;
+fn parse_json_path_field(
+    path: &str,
+    bytes: &[u8],
+    index: &mut usize,
+    is_relative: bool,
+) -> Result<JsonPathToken> {
+    let start = *index;
+    while *index < bytes.len() && !matches!(bytes[*index], b'.' | b'[' | b']') {
+        *index += 1;
     }
-    if start == index {
+    if start == *index {
+        let prefix = if is_relative { "$." } else { "" };
         return Err(Error::config(format!(
-            "json path '$.{path}' contains an empty field"
+            "json path '{prefix}{path}' contains an empty field"
         )));
     }
-    let field = &path[start..index];
+    let field = &path[start..*index];
     if field.contains('*') || field.contains('?') || field.contains('"') || field.contains('\'') {
+        let prefix = if is_relative { "$." } else { "" };
         return Err(Error::config(format!(
-            "json path '$.{path}' uses unsupported field syntax"
+            "json path '{prefix}{path}' uses unsupported field syntax"
         )));
     }
-    tokens.push(JsonPathToken::Field(field.to_string()));
+    Ok(JsonPathToken::Field(field.to_string()))
+}
 
+fn parse_json_path_segments(
+    path: &str,
+    bytes: &[u8],
+    mut index: usize,
+    is_relative: bool,
+    mut tokens: Vec<JsonPathToken>,
+) -> Result<Vec<JsonPathToken>> {
+    let prefix = if is_relative { "$." } else { "" };
     while index < bytes.len() {
         match bytes[index] {
             b'.' => {
                 index += 1;
-                let start = index;
-                while index < bytes.len() && !matches!(bytes[index], b'.' | b'[' | b']') {
-                    index += 1;
-                }
-                if start == index {
-                    return Err(Error::config(format!(
-                        "json path '$.{path}' contains an empty field"
-                    )));
-                }
-                let field = &path[start..index];
-                if field.contains('*')
-                    || field.contains('?')
-                    || field.contains('"')
-                    || field.contains('\'')
-                {
-                    return Err(Error::config(format!(
-                        "json path '$.{path}' uses unsupported field syntax"
-                    )));
-                }
-                tokens.push(JsonPathToken::Field(field.to_string()));
+                tokens.push(parse_json_path_field(path, bytes, &mut index, is_relative)?);
             }
             b'[' => {
                 index += 1;
@@ -613,35 +605,47 @@ fn parse_relative_path_body(path: &str) -> Result<Vec<JsonPathToken>> {
                 }
                 if index >= bytes.len() {
                     return Err(Error::config(format!(
-                        "json path '$.{path}' has an unclosed index"
+                        "json path '{prefix}{path}' has an unclosed index"
                     )));
                 }
                 let raw_index = &path[start..index];
                 if raw_index.is_empty() || !raw_index.chars().all(|ch| ch.is_ascii_digit()) {
                     return Err(Error::config(format!(
-                        "json path '$.{path}' only supports non-negative numeric indexes"
+                        "json path '{prefix}{path}' only supports non-negative numeric indexes"
                     )));
                 }
                 let parsed = raw_index.parse::<usize>().map_err(|e| {
-                    Error::config(format!("json path '$.{path}' has an invalid index: {e}"))
+                    Error::config(format!(
+                        "json path '{prefix}{path}' has an invalid index: {e}"
+                    ))
                 })?;
                 tokens.push(JsonPathToken::Index(parsed));
                 index += 1;
             }
             b']' => {
                 return Err(Error::config(format!(
-                    "json path '$.{path}' has an unopened index"
+                    "json path '{prefix}{path}' has an unopened index"
                 )));
             }
             _ => {
                 return Err(Error::config(format!(
-                    "json path '$.{path}' expected '.' or '[' after '$'/segment"
+                    "json path '{prefix}{path}' expected '.' or '[' after '$'/segment"
                 )));
             }
         }
     }
-
     Ok(tokens)
+}
+
+/// Parse `field…` / `field[i]…` as if it were `$.{path}` (no String alloc).
+fn parse_relative_path_body(path: &str) -> Result<Vec<JsonPathToken>> {
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    let mut tokens = Vec::new();
+
+    // First segment is a field name (format!("$.{path}") always inserts `$.`).
+    tokens.push(parse_json_path_field(path, bytes, &mut index, true)?);
+    parse_json_path_segments(path, bytes, index, true, tokens)
 }
 
 fn extract_tokens<'a>(value: &'a Value, tokens: &[JsonPathToken]) -> Option<&'a Value> {
@@ -683,70 +687,10 @@ pub(crate) fn parse_json_path(path: &str) -> Result<Vec<JsonPathToken>> {
     }
 
     let bytes = path.as_bytes();
-    let mut index = 1;
-    let mut tokens = Vec::new();
-    while index < bytes.len() {
-        match bytes[index] {
-            b'.' => {
-                index += 1;
-                let start = index;
-                while index < bytes.len() && !matches!(bytes[index], b'.' | b'[' | b']') {
-                    index += 1;
-                }
-                if start == index {
-                    return Err(Error::config(format!(
-                        "json path '{path}' contains an empty field"
-                    )));
-                }
-                let field = &path[start..index];
-                if field.contains('*')
-                    || field.contains('?')
-                    || field.contains('"')
-                    || field.contains('\'')
-                {
-                    return Err(Error::config(format!(
-                        "json path '{path}' uses unsupported field syntax"
-                    )));
-                }
-                tokens.push(JsonPathToken::Field(field.to_string()));
-            }
-            b'[' => {
-                index += 1;
-                let start = index;
-                while index < bytes.len() && bytes[index] != b']' {
-                    index += 1;
-                }
-                if index >= bytes.len() {
-                    return Err(Error::config(format!(
-                        "json path '{path}' has an unclosed index"
-                    )));
-                }
-                let raw_index = &path[start..index];
-                if raw_index.is_empty() || !raw_index.chars().all(|ch| ch.is_ascii_digit()) {
-                    return Err(Error::config(format!(
-                        "json path '{path}' only supports non-negative numeric indexes"
-                    )));
-                }
-                let parsed = raw_index.parse::<usize>().map_err(|e| {
-                    Error::config(format!("json path '{path}' has an invalid index: {e}"))
-                })?;
-                tokens.push(JsonPathToken::Index(parsed));
-                index += 1;
-            }
-            b']' => {
-                return Err(Error::config(format!(
-                    "json path '{path}' has an unopened index"
-                )));
-            }
-            _ => {
-                return Err(Error::config(format!(
-                    "json path '{path}' expected '.' or '[' after '$'/segment"
-                )));
-            }
-        }
-    }
+    let index = 1;
+    let tokens = Vec::new();
 
-    Ok(tokens)
+    parse_json_path_segments(path, bytes, index, false, tokens)
 }
 
 fn stable_random_index(
