@@ -126,11 +126,15 @@ impl DependencyGraph {
         for node_idx in self.graph.node_indices() {
             let step_id = &self.graph[node_idx];
             if let Some(step) = self.scenario.get_step(step_id) {
+                let mut safe_url = step.request.url().clone();
+                let _ = safe_url.set_password(None);
+                let _ = safe_url.set_username("");
+
                 nodes.push(serde_json::json!({
                     "id": step.id,
                     "name": step.name,
                     "method": step.request.method().to_string(),
-                    "url": step.request.url().to_string(),
+                    "url": safe_url.to_string(),
                 }));
             }
         }
