@@ -1730,6 +1730,20 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_timeout() {
+        let config = ConfigBuilder::new()
+            .timeout(Duration::from_millis(500))
+            .build();
+        assert_eq!(config.global.timeout_ms, 500);
+
+        let config = ConfigBuilder::new().timeout(Duration::from_secs(3)).build();
+        assert_eq!(config.global.timeout_ms, 3000);
+
+        let config = ConfigBuilder::new().timeout(Duration::from_secs(0)).build();
+        assert_eq!(config.global.timeout_ms, 0);
+    }
+
+    #[test]
     fn test_toml_serialization() {
         let config = ConfigBuilder::new()
             .base_url("https://example.com")
