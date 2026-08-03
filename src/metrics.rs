@@ -159,6 +159,9 @@ impl RequestMetrics {
         if safe_url.password().is_some() {
             let _ = safe_url.set_password(None);
         }
+        if !safe_url.username().is_empty() {
+            let _ = safe_url.set_username("");
+        }
         let url = safe_url.as_str().to_string();
 
         let (status_code, success, ttfb_ms, response_size_bytes) = if let Some(resp) = response {
