@@ -669,6 +669,19 @@ pub struct InMemoryMetricsCollector {
     steps: Arc<DashMap<(ScenarioId, StepId), Arc<StepAggregate>>>,
 }
 
+/// Parameters for recording an attempt into the streaming aggregate.
+struct AggregateRecord {
+    scenario_id: ScenarioId,
+    step_id: StepId,
+    step_name: String,
+    scenario_name: String,
+    success: bool,
+    latency_ms: u64,
+    started_ms: i64,
+    completed_ms: i64,
+    vu_id: u32,
+}
+
 impl InMemoryMetricsCollector {
     /// Create a new in-memory metrics collector.
     ///
@@ -681,29 +694,23 @@ impl InMemoryMetricsCollector {
     }
 
     /// Apply one attempt to the streaming aggregate (shared by full and slim paths).
-    #[allow(clippy::too_many_arguments)]
-    fn record_into_aggregate(
-        &self,
-        scenario_id: ScenarioId,
-        step_id: StepId,
-        step_name: String,
-        scenario_name: String,
-        success: bool,
-        latency_ms: u64,
-        started_ms: i64,
-        completed_ms: i64,
-        vu_id: u32,
-    ) {
-        let key = (scenario_id, step_id);
+    fn record_into_aggregate(&self, record: AggregateRecord) {
+        let key = (record.scenario_id, record.step_id);
         let agg = self
             .steps
             .entry(key)
             .or_insert_with(|| Arc::new(StepAggregate::new()))
             .clone();
         // Capture the human-readable names once, from the first request seen.
-        agg.step_name.get_or_init(|| step_name);
-        agg.scenario_name.get_or_init(|| scenario_name);
-        agg.record(success, latency_ms, started_ms, completed_ms, vu_id);
+        agg.step_name.get_or_init(|| record.step_name);
+        agg.scenario_name.get_or_init(|| record.scenario_name);
+        agg.record(
+            record.success,
+            record.latency_ms,
+            record.started_ms,
+            record.completed_ms,
+            record.vu_id,
+        );
     }
 
     /// Build `StepMetrics` from a single aggregate. Success-only latency stats;
@@ -873,17 +880,17 @@ impl MetricsCollector for InMemoryMetricsCollector {
         let latency_ms = metrics.response_time_ms;
         let started_ms = metrics.timestamp.timestamp_millis();
         let completed_ms = metrics.completed_at.timestamp_millis();
-        self.record_into_aggregate(
-            metrics.scenario_id,
-            metrics.step_id,
-            metrics.step_name,
-            metrics.scenario_name,
-            metrics.success,
+        self.record_into_aggregate(AggregateRecord {
+            scenario_id: metrics.scenario_id,
+            step_id: metrics.step_id,
+            step_name: metrics.step_name,
+            scenario_name: metrics.scenario_name,
+            success: metrics.success,
             latency_ms,
             started_ms,
             completed_ms,
-            metrics.virtual_user_id,
-        );
+            vu_id: metrics.virtual_user_id,
+        });
         Ok(())
     }
 
