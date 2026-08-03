@@ -97,6 +97,48 @@ The `pummel` tool allows you to run load tests using configuration files.
 ./target/release/pummel --config examples/config_example.yaml --verbose
 ```
 
+### Hello Load Test
+
+Want to verify that Pummel is installed correctly? Create a minimal configuration that sends requests to a public HTTP echo service.
+
+Create `hello.yaml`:
+
+```yaml
+global:
+  virtual_users: 1
+  duration_seconds: 5
+  ramp_up_seconds: 0
+  think_time_ms: 0
+
+scenarios:
+  hello:
+    name: "Hello Load Test"
+    steps:
+      - "echo"
+
+steps:
+  echo:
+    name: "HTTP Echo"
+    method: "GET"
+    url: "https://httpbin.org/get"
+    timeout_ms: 5000
+    max_retries: 1
+    follow_redirects: true
+```
+
+Run the test:
+
+```bash
+./target/release/pummel --config hello.yaml
+```
+
+Expected output:
+
+- The load test completes successfully.
+- Requests are sent to `https://httpbin.org/get`.
+- A summary is printed showing request counts, response times, and success metrics.
+- The command exits with code `0` when the run succeeds.
+
 ### CLI Options
 
 ```
