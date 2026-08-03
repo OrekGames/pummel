@@ -1029,7 +1029,16 @@ impl VirtualUserContext {
                     break;
                 }
                 let _permit = match &semaphore {
-                    Some(sem) => Some(sem.acquire().await.unwrap()),
+                    Some(sem) => match sem.acquire().await {
+                        Ok(permit) => Some(permit),
+                        Err(err) => {
+                            last_error = Some(Error::engine(format!(
+                                "Failed to acquire semaphore permit: {}",
+                                err
+                            )));
+                            break;
+                        }
+                    },
                     None => None,
                 };
                 // Time only the send itself, starting AFTER the in-flight-request
