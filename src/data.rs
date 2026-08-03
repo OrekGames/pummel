@@ -771,3 +771,67 @@ fn splitmix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_csv_data_source_creation() {
+        let path = "test_path.csv";
+        let source = DataSource::csv(path);
+
+        assert_eq!(source.kind, DataSourceKind::Csv);
+        assert_eq!(source.path, path);
+        assert_eq!(source.root, None);
+        assert_eq!(source.access, DataAccessMode::default());
+        assert_eq!(source.exhaustion, DataExhaustion::default());
+        assert_eq!(source.seed, None);
+        assert!(source.columns.is_empty());
+    }
+
+    #[test]
+    fn test_json_data_source_creation() {
+        let path = "test_path.json";
+        let source = DataSource::json(path);
+
+        assert_eq!(source.kind, DataSourceKind::Json);
+        assert_eq!(source.path, path);
+        assert_eq!(source.root, None);
+        assert_eq!(source.access, DataAccessMode::default());
+        assert_eq!(source.exhaustion, DataExhaustion::default());
+        assert_eq!(source.seed, None);
+        assert!(source.columns.is_empty());
+    }
+
+    #[test]
+    fn test_datasource_access() {
+        let mut source = DataSource::csv("data.csv");
+
+        // Default is PerVu
+        assert_eq!(source.access, DataAccessMode::PerVu);
+
+        // Test Sequential
+        source = source.access(DataAccessMode::Sequential);
+        assert_eq!(source.access, DataAccessMode::Sequential);
+
+        // Test Random
+        source = source.access(DataAccessMode::Random);
+        assert_eq!(source.access, DataAccessMode::Random);
+
+        // Test PerVu
+        source = source.access(DataAccessMode::PerVu);
+        assert_eq!(source.access, DataAccessMode::PerVu);
+    }
+
+    #[test]
+    fn test_data_source_seed() {
+        let source = DataSource::csv("test.csv").seed(12345);
+        assert_eq!(source.seed, Some(12345));
+
+        let source2 = DataSource::json("test.json").seed(999);
+        assert_eq!(source2.seed, Some(999));
+        assert_eq!(source2.kind, DataSourceKind::Json);
+        assert_eq!(source2.path, "test.json");
+    }
+}
