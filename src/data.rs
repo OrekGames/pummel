@@ -777,6 +777,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_csv_data_source_creation() {
+        let path = "test_path.csv";
+        let source = DataSource::csv(path);
+
+        assert_eq!(source.kind, DataSourceKind::Csv);
+        assert_eq!(source.path, path);
+        assert_eq!(source.root, None);
+        assert_eq!(source.access, DataAccessMode::default());
+        assert_eq!(source.exhaustion, DataExhaustion::default());
+        assert_eq!(source.seed, None);
+        assert!(source.columns.is_empty());
+    }
+
+    #[test]
+    fn test_json_data_source_creation() {
+        let path = "test_path.json";
+        let source = DataSource::json(path);
+
+        assert_eq!(source.kind, DataSourceKind::Json);
+        assert_eq!(source.path, path);
+        assert_eq!(source.root, None);
+        assert_eq!(source.access, DataAccessMode::default());
+        assert_eq!(source.exhaustion, DataExhaustion::default());
+        assert_eq!(source.seed, None);
+        assert!(source.columns.is_empty());
+    }
+
+    #[test]
     fn test_datasource_access() {
         let mut source = DataSource::csv("data.csv");
 
