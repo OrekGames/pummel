@@ -110,6 +110,19 @@ pub struct RequestMetrics {
     pub labels: HashMap<String, String>,
 }
 
+pub struct RequestMetricsParams<'a> {
+    pub id: String,
+    pub step_id: StepId,
+    pub step_name: String,
+    pub scenario_id: ScenarioId,
+    pub scenario_name: String,
+    pub virtual_user_id: u32,
+    pub request: &'a Request,
+    pub response: Option<&'a Response>,
+    pub error: Option<String>,
+    pub elapsed: Duration,
+}
+
 impl RequestMetrics {
     /// Create new request metrics.
     ///
@@ -118,19 +131,19 @@ impl RequestMetrics {
     /// successful and failed attempts, so failures record their real latency
     /// instead of a misleading `0` (real elapsed on failure). Time-to-first-byte and the
     /// response size are read from the response when one is present.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        id: String,
-        step_id: StepId,
-        step_name: String,
-        scenario_id: ScenarioId,
-        scenario_name: String,
-        virtual_user_id: u32,
-        request: &Request,
-        response: Option<&Response>,
-        error: Option<String>,
-        elapsed: Duration,
-    ) -> Self {
+    pub fn new(params: RequestMetricsParams<'_>) -> Self {
+        let RequestMetricsParams {
+            id,
+            step_id,
+            step_name,
+            scenario_id,
+            scenario_name,
+            virtual_user_id,
+            request,
+            response,
+            error,
+            elapsed,
+        } = params;
         // Record latency in ms once; derive start time from the same integer so
         // timestamp math stays consistent with `response_time_ms` and avoids
         // `Duration::from_std` chrono conversion on every attempt.
@@ -669,6 +682,19 @@ pub struct InMemoryMetricsCollector {
     steps: Arc<DashMap<(ScenarioId, StepId), Arc<StepAggregate>>>,
 }
 
+/// Parameters for recording an attempt into the streaming aggregate.
+struct AggregateRecord {
+    scenario_id: ScenarioId,
+    step_id: StepId,
+    step_name: String,
+    scenario_name: String,
+    success: bool,
+    latency_ms: u64,
+    started_ms: i64,
+    completed_ms: i64,
+    vu_id: u32,
+}
+
 impl InMemoryMetricsCollector {
     /// Create a new in-memory metrics collector.
     ///
@@ -681,29 +707,23 @@ impl InMemoryMetricsCollector {
     }
 
     /// Apply one attempt to the streaming aggregate (shared by full and slim paths).
-    #[allow(clippy::too_many_arguments)]
-    fn record_into_aggregate(
-        &self,
-        scenario_id: ScenarioId,
-        step_id: StepId,
-        step_name: String,
-        scenario_name: String,
-        success: bool,
-        latency_ms: u64,
-        started_ms: i64,
-        completed_ms: i64,
-        vu_id: u32,
-    ) {
-        let key = (scenario_id, step_id);
+    fn record_into_aggregate(&self, record: AggregateRecord) {
+        let key = (record.scenario_id, record.step_id);
         let agg = self
             .steps
             .entry(key)
             .or_insert_with(|| Arc::new(StepAggregate::new()))
             .clone();
         // Capture the human-readable names once, from the first request seen.
-        agg.step_name.get_or_init(|| step_name);
-        agg.scenario_name.get_or_init(|| scenario_name);
-        agg.record(success, latency_ms, started_ms, completed_ms, vu_id);
+        agg.step_name.get_or_init(|| record.step_name);
+        agg.scenario_name.get_or_init(|| record.scenario_name);
+        agg.record(
+            record.success,
+            record.latency_ms,
+            record.started_ms,
+            record.completed_ms,
+            record.vu_id,
+        );
     }
 
     /// Build `StepMetrics` from a single aggregate. Success-only latency stats;
@@ -873,17 +893,17 @@ impl MetricsCollector for InMemoryMetricsCollector {
         let latency_ms = metrics.response_time_ms;
         let started_ms = metrics.timestamp.timestamp_millis();
         let completed_ms = metrics.completed_at.timestamp_millis();
-        self.record_into_aggregate(
-            metrics.scenario_id,
-            metrics.step_id,
-            metrics.step_name,
-            metrics.scenario_name,
-            metrics.success,
+        self.record_into_aggregate(AggregateRecord {
+            scenario_id: metrics.scenario_id,
+            step_id: metrics.step_id,
+            step_name: metrics.step_name,
+            scenario_name: metrics.scenario_name,
+            success: metrics.success,
             latency_ms,
             started_ms,
             completed_ms,
-            metrics.virtual_user_id,
-        );
+            vu_id: metrics.virtual_user_id,
+        });
         Ok(())
     }
 
@@ -1157,18 +1177,18 @@ mod tests {
         );
         let elapsed = Duration::from_millis(40);
 
-        full.record_request(RequestMetrics::new(
-            "req1".to_string(),
-            "step1".to_string(),
-            "Step 1".to_string(),
-            "scenario1".to_string(),
-            "Scenario 1".to_string(),
-            3,
-            &request,
-            Some(&response),
-            None,
+        full.record_request(RequestMetrics::new(RequestMetricsParams {
+            id: "req1".to_string(),
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 3,
+            request: &request,
+            response: Some(&response),
+            error: None,
             elapsed,
-        ))
+        }))
         .await
         .unwrap();
 
@@ -1220,18 +1240,18 @@ mod tests {
         );
 
         // Record a request
-        let metrics = RequestMetrics::new(
-            "req1".to_string(),
-            "step1".to_string(),
-            "Step 1".to_string(),
-            "scenario1".to_string(),
-            "Scenario 1".to_string(),
-            1,
-            &request,
-            Some(&response),
-            None,
-            Duration::from_millis(100),
-        );
+        let metrics = RequestMetrics::new(RequestMetricsParams {
+            id: "req1".to_string(),
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 1,
+            request: &request,
+            response: Some(&response),
+            error: None,
+            elapsed: Duration::from_millis(100),
+        });
 
         collector.record_request(metrics).await.unwrap();
 
@@ -1291,31 +1311,31 @@ mod tests {
         );
 
         // Record requests
-        let metrics1 = RequestMetrics::new(
-            "req1".to_string(),
-            "step1".to_string(),
-            "Step 1".to_string(),
-            "scenario1".to_string(),
-            "Scenario 1".to_string(),
-            1,
-            &request1,
-            Some(&response1),
-            None,
-            Duration::from_millis(100),
-        );
+        let metrics1 = RequestMetrics::new(RequestMetricsParams {
+            id: "req1".to_string(),
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 1,
+            request: &request1,
+            response: Some(&response1),
+            error: None,
+            elapsed: Duration::from_millis(100),
+        });
 
-        let metrics2 = RequestMetrics::new(
-            "req2".to_string(),
-            "step2".to_string(),
-            "Step 2".to_string(),
-            "scenario1".to_string(),
-            "Scenario 1".to_string(),
-            1,
-            &request2,
-            Some(&response2),
-            Some("Bad request".to_string()),
-            Duration::from_millis(200),
-        );
+        let metrics2 = RequestMetrics::new(RequestMetricsParams {
+            id: "req2".to_string(),
+            step_id: "step2".to_string(),
+            step_name: "Step 2".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 1,
+            request: &request2,
+            response: Some(&response2),
+            error: Some("Bad request".to_string()),
+            elapsed: Duration::from_millis(200),
+        });
 
         collector.record_request(metrics1).await.unwrap();
         collector.record_request(metrics2).await.unwrap();
@@ -1365,33 +1385,33 @@ mod tests {
         // One 100ms success and one failed transport attempt recorded with 0ms
         // (no response). The success min must remain 100, not collapse to 0.
         collector
-            .record_request(RequestMetrics::new(
-                "ok".to_string(),
-                "step1".to_string(),
-                "Step 1".to_string(),
-                "scenario1".to_string(),
-                "Scenario 1".to_string(),
-                0,
-                &request,
-                Some(&ok),
-                None,
-                Duration::from_millis(100),
-            ))
+            .record_request(RequestMetrics::new(RequestMetricsParams {
+                id: "ok".to_string(),
+                step_id: "step1".to_string(),
+                step_name: "Step 1".to_string(),
+                scenario_id: "scenario1".to_string(),
+                scenario_name: "Scenario 1".to_string(),
+                virtual_user_id: 0,
+                request: &request,
+                response: Some(&ok),
+                error: None,
+                elapsed: Duration::from_millis(100),
+            }))
             .await
             .unwrap();
         collector
-            .record_request(RequestMetrics::new(
-                "err".to_string(),
-                "step1".to_string(),
-                "Step 1".to_string(),
-                "scenario1".to_string(),
-                "Scenario 1".to_string(),
-                0,
-                &request,
-                None,
-                Some("connection refused".to_string()),
-                Duration::from_millis(0),
-            ))
+            .record_request(RequestMetrics::new(RequestMetricsParams {
+                id: "err".to_string(),
+                step_id: "step1".to_string(),
+                step_name: "Step 1".to_string(),
+                scenario_id: "scenario1".to_string(),
+                scenario_name: "Scenario 1".to_string(),
+                virtual_user_id: 0,
+                request: &request,
+                response: None,
+                error: Some("connection refused".to_string()),
+                elapsed: Duration::from_millis(0),
+            }))
             .await
             .unwrap();
 
@@ -1423,18 +1443,18 @@ mod tests {
             Duration::from_millis(100),
         );
 
-        let metrics = RequestMetrics::new(
-            "rejected".to_string(),
-            "step1".to_string(),
-            "Step 1".to_string(),
-            "scenario1".to_string(),
-            "Scenario 1".to_string(),
-            0,
-            &request,
-            Some(&ok_body),
-            Some("validation failed".to_string()),
-            Duration::from_millis(500),
-        );
+        let metrics = RequestMetrics::new(RequestMetricsParams {
+            id: "rejected".to_string(),
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 0,
+            request: &request,
+            response: Some(&ok_body),
+            error: Some("validation failed".to_string()),
+            elapsed: Duration::from_millis(500),
+        });
         assert!(
             !metrics.success,
             "2xx that fails validation must not be a success"
@@ -1467,18 +1487,18 @@ mod tests {
         );
         let elapsed = Duration::from_millis(40);
 
-        let full = RequestMetrics::new(
-            "accepted-404".to_string(),
-            "step1".to_string(),
-            "Step 1".to_string(),
-            "scenario1".to_string(),
-            "Scenario 1".to_string(),
-            0,
-            &request,
-            Some(&not_found),
-            None,
+        let full = RequestMetrics::new(RequestMetricsParams {
+            id: "accepted-404".to_string(),
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 0,
+            request: &request,
+            response: Some(&not_found),
+            error: None,
             elapsed,
-        );
+        });
         assert!(
             full.success,
             "non-2xx with no scenario error must count as success"
@@ -1524,18 +1544,18 @@ mod tests {
         );
 
         // Record a request
-        let metrics = RequestMetrics::new(
-            "req1".to_string(),
-            "step1".to_string(),
-            "Step 1".to_string(),
-            "scenario1".to_string(),
-            "Scenario 1".to_string(),
-            1,
-            &request,
-            Some(&response),
-            None,
-            Duration::from_millis(100),
-        );
+        let metrics = RequestMetrics::new(RequestMetricsParams {
+            id: "req1".to_string(),
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 1,
+            request: &request,
+            response: Some(&response),
+            error: None,
+            elapsed: Duration::from_millis(100),
+        });
 
         collector.record_request(metrics).await.unwrap();
 

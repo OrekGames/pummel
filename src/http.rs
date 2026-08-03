@@ -432,7 +432,7 @@ impl Response {
     /// Parse the response body as JSON
     pub fn json<T: for<'de> Deserialize<'de>>(&self) -> Result<T> {
         match &self.body {
-            Body::Json(value) => serde_json::from_value(value.clone()).map_err(Error::from),
+            Body::Json(value) => T::deserialize(value).map_err(Error::from),
             Body::Text(text) => serde_json::from_str(text).map_err(Error::from),
             Body::Binary(bytes) => serde_json::from_slice(bytes).map_err(Error::from),
             Body::Empty => Err(Error::other("Empty response body")),
