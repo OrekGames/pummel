@@ -1,9 +1,12 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lru::LruCache;
 use rand::RngExt;
 use serde::de::IgnoredAny;
 use tokio::sync::{Mutex, Semaphore};
@@ -437,9 +440,26 @@ fn branch_matches(
                 if let Some(regex) = branch.compiled_regex.as_ref() {
                     regex.is_match(&haystack)
                 } else if let Some(pattern) = &branch.value {
-                    regex::Regex::new(pattern)
-                        .map(|regex| regex.is_match(&haystack))
-                        .unwrap_or(false)
+                    thread_local! {
+                        static REGEX_CACHE: RefCell<LruCache<String, regex::Regex>> = RefCell::new(
+                            LruCache::new(NonZeroUsize::new(1000).unwrap())
+                        );
+                    }
+
+                    REGEX_CACHE.with(|cache| {
+                        let mut cache = cache.borrow_mut();
+                        if let Some(regex) = cache.get(pattern) {
+                            return regex.is_match(&haystack);
+                        }
+
+                        if let Ok(regex) = regex::Regex::new(pattern) {
+                            let is_match = regex.is_match(&haystack);
+                            cache.put(pattern.clone(), regex);
+                            is_match
+                        } else {
+                            false
+                        }
+                    })
                 } else {
                     false
                 }
@@ -561,13 +581,40 @@ fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
     })
 }
 
+fn dynamic_regex_cache() -> &'static std::sync::Mutex<LruCache<String, Arc<regex::Regex>>> {
+    static CACHE: OnceLock<std::sync::Mutex<LruCache<String, Arc<regex::Regex>>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())))
+}
+
 fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<String>> {
     if let Some(regex) = extractor.compiled_regex.as_ref() {
         return Ok(regex_capture(regex, haystack));
     }
-    let regex = regex::Regex::new(&extractor.selector)
-        .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?;
-    Ok(regex_capture(&regex, haystack))
+
+    let cache = dynamic_regex_cache();
+
+    // Fast path: Try reading from LRU and clone the Arc so we don't hold the lock during capture.
+    let cached_re = {
+        let mut cache_lock = cache.lock().unwrap();
+        cache_lock.get(&extractor.selector).cloned()
+    };
+
+    if let Some(re) = cached_re {
+        return Ok(regex_capture(&re, haystack));
+    }
+
+    // Slow path: Compile outside the lock, then insert
+    let re = Arc::new(
+        regex::Regex::new(&extractor.selector)
+            .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?,
+    );
+
+    {
+        let mut cache_lock = cache.lock().unwrap();
+        cache_lock.put(extractor.selector.clone(), re.clone());
+    }
+
+    Ok(regex_capture(&re, haystack))
 }
 
 fn run_extractor(
@@ -722,6 +769,7 @@ impl VirtualUserContext {
     /// Create a new virtual user context
     fn new(id: u32, scenario: Arc<Scenario>, shared_state: SharedEngineState) -> Self {
         let mut step_statuses = HashMap::new();
+        let mut ready_buf = Vec::new();
 
         // Initialize all steps as waiting
         for step in scenario.get_steps() {
@@ -731,6 +779,7 @@ impl VirtualUserContext {
         // Mark steps with no dependencies as ready
         for step in scenario.get_root_steps() {
             step_statuses.insert(step.id.clone(), StepStatus::Ready);
+            ready_buf.push(step.id.clone());
         }
 
         Self {
@@ -740,7 +789,7 @@ impl VirtualUserContext {
             metrics_collector: shared_state.metrics_collector,
             telemetry_exporter: shared_state.telemetry_exporter,
             step_statuses,
-            ready_buf: Vec::new(),
+            ready_buf,
             options: shared_state.options,
             semaphore: shared_state.semaphore,
             rate_limiter: shared_state.rate_limiter,
@@ -762,9 +811,11 @@ impl VirtualUserContext {
         for status in self.step_statuses.values_mut() {
             *status = StepStatus::Waiting;
         }
+        self.ready_buf.clear();
         for step_id in &self.scenario.root_step_ids {
             if let Some(status) = self.step_statuses.get_mut(step_id) {
                 *status = StepStatus::Ready;
+                self.ready_buf.push(step_id.clone());
             }
         }
     }
@@ -782,16 +833,6 @@ impl VirtualUserContext {
     /// rather than `&Step` so the caller can drop the `self` borrow before the
     /// concurrent sends.
     fn take_ready_steps(&mut self) -> Vec<StepId> {
-        self.ready_buf.clear();
-
-        // Walk statuses (typically fewer Ready entries than total steps in deep
-        // DAGs) instead of scanning every scenario step.
-        for (step_id, status) in &self.step_statuses {
-            if matches!(status, StepStatus::Ready) {
-                self.ready_buf.push(step_id.clone());
-            }
-        }
-
         self.ready_buf.sort_unstable_by(|a, b| {
             let wa = self
                 .scenario
@@ -860,6 +901,7 @@ impl VirtualUserContext {
                 && let Some(status) = self.step_statuses.get_mut(&dep_step_id)
             {
                 *status = StepStatus::Ready;
+                self.ready_buf.push(dep_step_id.clone());
             }
         }
     }
