@@ -803,4 +803,24 @@ mod tests {
         assert_eq!(source.seed, None);
         assert!(source.columns.is_empty());
     }
+
+    #[test]
+    fn test_datasource_access() {
+        let mut source = DataSource::csv("data.csv");
+
+        // Default is PerVu
+        assert_eq!(source.access, DataAccessMode::PerVu);
+
+        // Test Sequential
+        source = source.access(DataAccessMode::Sequential);
+        assert_eq!(source.access, DataAccessMode::Sequential);
+
+        // Test Random
+        source = source.access(DataAccessMode::Random);
+        assert_eq!(source.access, DataAccessMode::Random);
+
+        // Test PerVu
+        source = source.access(DataAccessMode::PerVu);
+        assert_eq!(source.access, DataAccessMode::PerVu);
+    }
 }
