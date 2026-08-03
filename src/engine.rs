@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use lru::LruCache;
 use rand::RngExt;
 use serde::de::IgnoredAny;
 use tokio::sync::{Mutex, Semaphore};
@@ -561,13 +563,40 @@ fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
     })
 }
 
+fn dynamic_regex_cache() -> &'static std::sync::Mutex<LruCache<String, Arc<regex::Regex>>> {
+    static CACHE: OnceLock<std::sync::Mutex<LruCache<String, Arc<regex::Regex>>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())))
+}
+
 fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<String>> {
     if let Some(regex) = extractor.compiled_regex.as_ref() {
         return Ok(regex_capture(regex, haystack));
     }
-    let regex = regex::Regex::new(&extractor.selector)
-        .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?;
-    Ok(regex_capture(&regex, haystack))
+
+    let cache = dynamic_regex_cache();
+
+    // Fast path: Try reading from LRU and clone the Arc so we don't hold the lock during capture.
+    let cached_re = {
+        let mut cache_lock = cache.lock().unwrap();
+        cache_lock.get(&extractor.selector).cloned()
+    };
+
+    if let Some(re) = cached_re {
+        return Ok(regex_capture(&re, haystack));
+    }
+
+    // Slow path: Compile outside the lock, then insert
+    let re = Arc::new(
+        regex::Regex::new(&extractor.selector)
+            .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?,
+    );
+
+    {
+        let mut cache_lock = cache.lock().unwrap();
+        cache_lock.put(extractor.selector.clone(), re.clone());
+    }
+
+    Ok(regex_capture(&re, haystack))
 }
 
 fn run_extractor(
