@@ -642,6 +642,30 @@ fn combine_run_status(current: RunStatus, next: RunStatus) -> RunStatus {
     }
 }
 
+/// Shared state for all virtual users in a scenario
+struct SharedEngineState {
+    /// HTTP client
+    http_client: Arc<dyn HttpClient>,
+
+    /// Metrics collector
+    metrics_collector: Arc<dyn MetricsCollector>,
+
+    /// Optional telemetry exporter
+    telemetry_exporter: Option<Arc<dyn TelemetryExporter>>,
+
+    /// Execution options
+    options: ExecutionOptions,
+
+    /// Optional in-flight-request cap
+    semaphore: Option<Arc<Semaphore>>,
+
+    /// Optional request-attempt start-rate limiter
+    rate_limiter: Option<Arc<RateLimiter>>,
+
+    /// Loaded data sources
+    data_sources: Arc<LoadedDataSources>,
+}
+
 /// Context for a virtual user
 struct VirtualUserContext {
     /// Virtual user ID
@@ -696,18 +720,7 @@ struct VirtualUserContext {
 
 impl VirtualUserContext {
     /// Create a new virtual user context
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        id: u32,
-        scenario: Arc<Scenario>,
-        http_client: Arc<dyn HttpClient>,
-        metrics_collector: Arc<dyn MetricsCollector>,
-        telemetry_exporter: Option<Arc<dyn TelemetryExporter>>,
-        options: ExecutionOptions,
-        semaphore: Option<Arc<Semaphore>>,
-        rate_limiter: Option<Arc<RateLimiter>>,
-        data_sources: Arc<LoadedDataSources>,
-    ) -> Self {
+    fn new(id: u32, scenario: Arc<Scenario>, shared_state: SharedEngineState) -> Self {
         let mut step_statuses = HashMap::new();
 
         // Initialize all steps as waiting
@@ -723,16 +736,16 @@ impl VirtualUserContext {
         Self {
             id,
             scenario: scenario.clone(),
-            http_client,
-            metrics_collector,
-            telemetry_exporter,
+            http_client: shared_state.http_client,
+            metrics_collector: shared_state.metrics_collector,
+            telemetry_exporter: shared_state.telemetry_exporter,
             step_statuses,
             ready_buf: Vec::new(),
-            options,
-            semaphore,
-            rate_limiter,
+            options: shared_state.options,
+            semaphore: shared_state.semaphore,
+            rate_limiter: shared_state.rate_limiter,
             vu_context: Arc::new(Mutex::new(VuContext::new(id, scenario.id.clone()))),
-            data_sources,
+            data_sources: shared_state.data_sources,
             end_time: None,
             status: VirtualUserStatus::Waiting,
         }
@@ -1662,18 +1675,19 @@ impl Engine {
                     },
                 };
 
-                // Create a virtual user context
-                let mut context = VirtualUserContext::new(
-                    i,
-                    scenario_clone,
+                // Create shared engine state
+                let shared_state = SharedEngineState {
                     http_client,
-                    metrics_collector_clone,
-                    telemetry_exporter_clone,
-                    options_clone,
-                    request_semaphore_clone,
-                    rate_limiter_clone,
-                    data_sources_clone,
-                );
+                    metrics_collector: metrics_collector_clone,
+                    telemetry_exporter: telemetry_exporter_clone,
+                    options: options_clone,
+                    semaphore: request_semaphore_clone,
+                    rate_limiter: rate_limiter_clone,
+                    data_sources: data_sources_clone,
+                };
+
+                // Create a virtual user context
+                let mut context = VirtualUserContext::new(i, scenario_clone, shared_state);
 
                 context.run(deadline).await
             });
