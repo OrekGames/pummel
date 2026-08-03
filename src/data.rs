@@ -771,3 +771,28 @@ fn splitmix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_datasource_access() {
+        let mut source = DataSource::csv("data.csv");
+
+        // Default is PerVu
+        assert_eq!(source.access, DataAccessMode::PerVu);
+
+        // Test Sequential
+        source = source.access(DataAccessMode::Sequential);
+        assert_eq!(source.access, DataAccessMode::Sequential);
+
+        // Test Random
+        source = source.access(DataAccessMode::Random);
+        assert_eq!(source.access, DataAccessMode::Random);
+
+        // Test PerVu
+        source = source.access(DataAccessMode::PerVu);
+        assert_eq!(source.access, DataAccessMode::PerVu);
+    }
+}
