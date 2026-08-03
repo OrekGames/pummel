@@ -1107,18 +1107,18 @@ impl VirtualUserContext {
                     // Record this attempt (response present so size/ttfb/status
                     // are captured on the full path) before moving `resp`.
                     if record_full {
-                        attempts.push(RequestMetrics::new(
-                            attempt_id,
-                            step.id.clone(),
-                            step.name.clone(),
-                            scenario.id.clone(),
-                            scenario.name.clone(),
-                            vu_id,
-                            &request,
-                            Some(&resp),
-                            error.clone(),
+                        attempts.push(RequestMetrics::new(crate::metrics::RequestMetricsParams {
+                            id: attempt_id,
+                            step_id: step.id.clone(),
+                            step_name: step.name.clone(),
+                            scenario_id: scenario.id.clone(),
+                            scenario_name: scenario.name.clone(),
+                            virtual_user_id: vu_id,
+                            request: &request,
+                            response: Some(&resp),
+                            error: error.clone(),
                             elapsed,
-                        ));
+                        }));
                     } else if use_summary
                         && let Err(err) = metrics_collector
                             .record_attempt_summary(AttemptSummary {
@@ -1150,18 +1150,18 @@ impl VirtualUserContext {
                 Ok(Err(err)) => {
                     // Transport error: no response, but real elapsed is recorded.
                     if record_full {
-                        attempts.push(RequestMetrics::new(
-                            attempt_id,
-                            step.id.clone(),
-                            step.name.clone(),
-                            scenario.id.clone(),
-                            scenario.name.clone(),
-                            vu_id,
-                            &request,
-                            None,
-                            Some(err.to_string()),
+                        attempts.push(RequestMetrics::new(crate::metrics::RequestMetricsParams {
+                            id: attempt_id,
+                            step_id: step.id.clone(),
+                            step_name: step.name.clone(),
+                            scenario_id: scenario.id.clone(),
+                            scenario_name: scenario.name.clone(),
+                            virtual_user_id: vu_id,
+                            request: &request,
+                            response: None,
+                            error: Some(err.to_string()),
                             elapsed,
-                        ));
+                        }));
                     } else if use_summary
                         && let Err(record_err) = metrics_collector
                             .record_attempt_summary(AttemptSummary {
@@ -1187,18 +1187,18 @@ impl VirtualUserContext {
                     // the retry loop treat it like any other failure.
                     let msg = format!("step '{}' timed out after {:?}", step.id, step.timeout);
                     if record_full {
-                        attempts.push(RequestMetrics::new(
-                            attempt_id,
-                            step.id.clone(),
-                            step.name.clone(),
-                            scenario.id.clone(),
-                            scenario.name.clone(),
-                            vu_id,
-                            &request,
-                            None,
-                            Some(msg.clone()),
+                        attempts.push(RequestMetrics::new(crate::metrics::RequestMetricsParams {
+                            id: attempt_id,
+                            step_id: step.id.clone(),
+                            step_name: step.name.clone(),
+                            scenario_id: scenario.id.clone(),
+                            scenario_name: scenario.name.clone(),
+                            virtual_user_id: vu_id,
+                            request: &request,
+                            response: None,
+                            error: Some(msg.clone()),
                             elapsed,
-                        ));
+                        }));
                     } else if use_summary
                         && let Err(err) = metrics_collector
                             .record_attempt_summary(AttemptSummary {
