@@ -1,10 +1,22 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+//! Metrics Criterion benches.
+//!
+//! Construct-only hot path (P3):
+//! ```text
+//! cargo bench --bench metrics_benchmark -- construct --save-baseline before
+//! cargo bench --bench metrics_benchmark -- construct --baseline before
+//! ```
+
+use std::hint::black_box;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use pummel::http::{Body, HttpStatus, Request, Response};
 use pummel::metrics::{
     InMemoryMetricsCollector, MetricsCollector, MetricsCollectorFactory, RequestMetrics,
 };
-use std::sync::Arc;
-use std::time::Duration;
+use serde_json::json;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -46,18 +58,18 @@ fn create_test_metrics(
         .map(|r| r.response_time())
         .unwrap_or_default();
 
-    RequestMetrics::new(
-        Uuid::new_v4().to_string(),
-        step_id.to_string(),
-        step_id.to_string(),
-        scenario_id.to_string(),
-        scenario_id.to_string(),
+    RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+        id: Uuid::new_v4().to_string(),
+        step_id: step_id.to_string(),
+        step_name: step_id.to_string(),
+        scenario_id: scenario_id.to_string(),
+        scenario_name: scenario_id.to_string(),
         virtual_user_id,
-        &request,
-        response.as_ref(),
+        request: &request,
+        response: response.as_ref(),
         error,
         elapsed,
-    )
+    })
 }
 
 // Benchmark single-threaded recording of metrics
@@ -280,6 +292,129 @@ fn bench_factory_methods(c: &mut Criterion) {
     group.finish();
 }
 
+/// Isolate `RequestMetrics::new` construct cost (string/chrono/body-size work).
+/// Inputs are fixed outside the timed loop so UUID/request build do not dominate.
+fn bench_request_metrics_construct(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_metrics_construct");
+    group.throughput(Throughput::Elements(1));
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(3));
+
+    let request = Request::get("https://localhost/api/v1/items?limit=50")
+        .build()
+        .unwrap();
+    let elapsed = Duration::from_millis(42);
+    let id = "req-00000000-0000-0000-0000-000000000001";
+    let step_id = "step_1";
+    let step_name = "Step 1";
+    let scenario_id = "scenario_1";
+    let scenario_name = "Scenario 1";
+
+    let binary_body = Bytes::from(vec![b'x'; 1024]);
+    let binary_resp = Response::new(
+        HttpStatus::OK,
+        Default::default(),
+        Body::Binary(binary_body),
+        elapsed,
+    );
+
+    let text_resp = Response::new(
+        HttpStatus::OK,
+        Default::default(),
+        Body::Text("x".repeat(1024)),
+        elapsed,
+    );
+
+    let json_value = json!({
+        "ok": true,
+        "items": (0..32).map(|i| json!({
+            "id": i,
+            "name": format!("item-{i}"),
+            "payload": "y".repeat(64),
+        })).collect::<Vec<_>>(),
+    });
+    let json_resp = Response::new(
+        HttpStatus::OK,
+        Default::default(),
+        Body::Json(json_value),
+        elapsed,
+    );
+
+    group.bench_function("success_binary_1k", |b| {
+        b.iter(|| {
+            let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                id: black_box(id).to_string(),
+                step_id: black_box(step_id).to_string(),
+                step_name: black_box(step_name).to_string(),
+                scenario_id: black_box(scenario_id).to_string(),
+                scenario_name: black_box(scenario_name).to_string(),
+                virtual_user_id: black_box(1u32),
+                request: black_box(&request),
+                response: Some(black_box(&binary_resp)),
+                error: None,
+                elapsed: black_box(elapsed),
+            });
+            black_box(metrics)
+        });
+    });
+
+    group.bench_function("success_text_1k", |b| {
+        b.iter(|| {
+            let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                id: black_box(id).to_string(),
+                step_id: black_box(step_id).to_string(),
+                step_name: black_box(step_name).to_string(),
+                scenario_id: black_box(scenario_id).to_string(),
+                scenario_name: black_box(scenario_name).to_string(),
+                virtual_user_id: black_box(1u32),
+                request: black_box(&request),
+                response: Some(black_box(&text_resp)),
+                error: None,
+                elapsed: black_box(elapsed),
+            });
+            black_box(metrics)
+        });
+    });
+
+    group.bench_function("success_json_nested", |b| {
+        b.iter(|| {
+            let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                id: black_box(id).to_string(),
+                step_id: black_box(step_id).to_string(),
+                step_name: black_box(step_name).to_string(),
+                scenario_id: black_box(scenario_id).to_string(),
+                scenario_name: black_box(scenario_name).to_string(),
+                virtual_user_id: black_box(1u32),
+                request: black_box(&request),
+                response: Some(black_box(&json_resp)),
+                error: None,
+                elapsed: black_box(elapsed),
+            });
+            black_box(metrics)
+        });
+    });
+
+    group.bench_function("failure_no_response", |b| {
+        b.iter(|| {
+            let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                id: black_box(id).to_string(),
+                step_id: black_box(step_id).to_string(),
+                step_name: black_box(step_name).to_string(),
+                scenario_id: black_box(scenario_id).to_string(),
+                scenario_name: black_box(scenario_name).to_string(),
+                virtual_user_id: black_box(1u32),
+                request: black_box(&request),
+                response: None,
+                error: Some(black_box("connection refused").to_string()),
+                elapsed: black_box(elapsed),
+            });
+            black_box(metrics)
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_threaded_recording,
@@ -287,5 +422,6 @@ criterion_group!(
     bench_burst_recording,
     bench_metrics_retrieval,
     bench_factory_methods,
+    bench_request_metrics_construct,
 );
 criterion_main!(benches);

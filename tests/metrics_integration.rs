@@ -46,36 +46,36 @@ fn success_metric(step: &str, scenario: &str, vu: u32, latency_ms: u64) -> Reque
         Body::Empty,
         Duration::from_millis(latency_ms),
     );
-    RequestMetrics::new(
-        format!("ok-{latency_ms}-{vu}"),
-        step.to_string(),
-        step.to_string(),
-        scenario.to_string(),
-        scenario.to_string(),
-        vu,
-        &request,
-        Some(&resp),
-        None,
-        Duration::from_millis(latency_ms),
-    )
+    RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+        id: format!("ok-{latency_ms}-{vu}"),
+        step_id: step.to_string(),
+        step_name: step.to_string(),
+        scenario_id: scenario.to_string(),
+        scenario_name: scenario.to_string(),
+        virtual_user_id: vu,
+        request: &request,
+        response: Some(&resp),
+        error: None,
+        elapsed: Duration::from_millis(latency_ms),
+    })
 }
 
 /// Build a failed (transport-error, no response) `RequestMetrics` recording the
 /// real elapsed `latency_ms`.
 fn failure_metric(step: &str, scenario: &str, vu: u32, latency_ms: u64) -> RequestMetrics {
     let request = Request::get("https://example.com").build().unwrap();
-    RequestMetrics::new(
-        format!("err-{latency_ms}-{vu}"),
-        step.to_string(),
-        step.to_string(),
-        scenario.to_string(),
-        scenario.to_string(),
-        vu,
-        &request,
-        None,
-        Some("connection refused".to_string()),
-        Duration::from_millis(latency_ms),
-    )
+    RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+        id: format!("err-{latency_ms}-{vu}"),
+        step_id: step.to_string(),
+        step_name: step.to_string(),
+        scenario_id: scenario.to_string(),
+        scenario_name: scenario.to_string(),
+        virtual_user_id: vu,
+        request: &request,
+        response: None,
+        error: Some("connection refused".to_string()),
+        elapsed: Duration::from_millis(latency_ms),
+    })
 }
 
 /// Fails (`Err`) for the first `fail_count` calls, then returns `200 OK`.
@@ -378,18 +378,18 @@ async fn proof4_response_time_includes_body_ttfb_populated() {
     );
 
     // And the plumbed RequestMetrics reflects both phases.
-    let m = RequestMetrics::new(
-        "r".into(),
-        "step".into(),
-        "Step".into(),
-        "s".into(),
-        "Scenario".into(),
-        0,
-        &request,
-        Some(&resp),
-        None,
-        total,
-    );
+    let m = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+        id: "r".into(),
+        step_id: "step".into(),
+        step_name: "Step".into(),
+        scenario_id: "s".into(),
+        scenario_name: "Scenario".into(),
+        virtual_user_id: 0,
+        request: &request,
+        response: Some(&resp),
+        error: None,
+        elapsed: total,
+    });
     assert!(
         m.ttfb_ms.is_some(),
         "RequestMetrics.ttfb_ms must be populated"
@@ -424,18 +424,18 @@ async fn proof5_body_not_eagerly_json_parsed() {
     );
 
     // response_size_bytes must be populated from the byte length.
-    let m = RequestMetrics::new(
-        "r".into(),
-        "step".into(),
-        "Step".into(),
-        "s".into(),
-        "Scenario".into(),
-        0,
-        &request,
-        Some(&resp),
-        None,
-        resp.response_time(),
-    );
+    let m = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+        id: "r".into(),
+        step_id: "step".into(),
+        step_name: "Step".into(),
+        scenario_id: "s".into(),
+        scenario_name: "Scenario".into(),
+        virtual_user_id: 0,
+        request: &request,
+        response: Some(&resp),
+        error: None,
+        elapsed: resp.response_time(),
+    });
     assert_eq!(
         m.response_size_bytes,
         Some(3),

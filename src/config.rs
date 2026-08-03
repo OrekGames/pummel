@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::{Method, Url, header};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng as serde_yaml;
 use toml;
@@ -236,7 +237,7 @@ impl Config {
             if let Some(json) = &step.json {
                 validate_template(&format!("steps.{step_id}.json"), json)?;
                 if !contains_template(json) {
-                    serde_json::from_str::<serde_json::Value>(json).map_err(|e| {
+                    serde_json::from_str::<IgnoredAny>(json).map_err(|e| {
                         Error::config(format!("Invalid JSON for step '{step_id}': {e}"))
                     })?;
                 }
@@ -408,10 +409,22 @@ impl Config {
         } else if let Some(body) = &config.body {
             request.text(body)
         } else if let Some(json) = &config.json {
-            // Parse the JSON string into a serde_json::Value
-            let json_value: serde_json::Value = serde_json::from_str(json)
-                .map_err(|e| Error::config(format!("Invalid JSON for step '{id}': {e}")))?;
-            request.json(&json_value)
+            let has_content_type = config
+                .headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("content-type"))
+                || (!needs_dynamic
+                    && self
+                        .global
+                        .headers
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case("content-type")));
+            let request = request.binary(bytes::Bytes::from(json.clone()));
+            if !has_content_type {
+                request.header("Content-Type", "application/json")
+            } else {
+                request
+            }
         } else {
             request
         };
@@ -1717,6 +1730,29 @@ mod tests {
     }
 
     #[test]
+    fn test_config_builder_virtual_users() {
+        let config1 = ConfigBuilder::new().virtual_users(42).build();
+        assert_eq!(config1.global.virtual_users, 42);
+
+        let config2 = ConfigBuilder::new().virtual_users(0).build();
+        assert_eq!(config2.global.virtual_users, 0);
+    }
+
+    #[test]
+    fn test_builder_timeout() {
+        let config = ConfigBuilder::new()
+            .timeout(Duration::from_millis(500))
+            .build();
+        assert_eq!(config.global.timeout_ms, 500);
+
+        let config = ConfigBuilder::new().timeout(Duration::from_secs(3)).build();
+        assert_eq!(config.global.timeout_ms, 3000);
+
+        let config = ConfigBuilder::new().timeout(Duration::from_secs(0)).build();
+        assert_eq!(config.global.timeout_ms, 0);
+    }
+
+    #[test]
     fn test_toml_serialization() {
         let config = ConfigBuilder::new()
             .base_url("https://example.com")
@@ -2197,5 +2233,72 @@ global:
             reparsed.steps.get("a").unwrap().url,
             original.steps.get("a").unwrap().url
         );
+    }
+
+    #[test]
+    fn test_dynamic_lint_report_empty() {
+        let config = Config::default();
+        let report = config.dynamic_lint_report().unwrap();
+        assert_eq!(report.data_sources, 0);
+        assert_eq!(report.dynamic_steps, 0);
+        assert_eq!(report.templates, 0);
+        assert_eq!(report.extractors, 0);
+        assert_eq!(report.branches, 0);
+    }
+
+    #[test]
+    fn test_dynamic_lint_report_populated() {
+        // We simulate having a real CSV file just by building the string config
+        // Note: The dynamic lint report actually validates data source ID and basic
+        // structure. However, it also tries to load the source.
+        // Let's create a temporary file.
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut tmp_file = NamedTempFile::new().unwrap();
+        writeln!(tmp_file, "id,name\n1,Alice").unwrap();
+        let tmp_path = tmp_file.path().to_str().unwrap().replace('\\', "/");
+
+        let toml_str = format!(
+            r#"
+            [global]
+            base_url = "https://example.com"
+
+            [data_sources.users]
+            type = "csv"
+            path = "{}"
+
+            [scenarios.simple]
+            name = "Simple Scenario"
+            steps = ["step1", "step2"]
+
+            [steps.step1]
+            name = "Step 1"
+            method = "GET"
+            url = "/api/resource/{{{{vu.id}}}}"
+            [[steps.step1.extractors]]
+            name = "token"
+            json_path = "$.token"
+
+            [steps.step2]
+            name = "Step 2"
+            method = "POST"
+            url = "/api/resource"
+            dependencies = ["step1"]
+            json = '{{"data": "{{{{var.token}}}}"}}'
+
+            [steps.step2.branch]
+            variable = "token"
+            condition = "exists"
+        "#,
+            tmp_path
+        );
+        let config = Config::from_toml_str(&toml_str).unwrap();
+        let report = config.dynamic_lint_report().unwrap();
+        assert_eq!(report.data_sources, 1);
+        assert_eq!(report.dynamic_steps, 2);
+        assert_eq!(report.templates, 2);
+        assert_eq!(report.extractors, 1);
+        assert_eq!(report.branches, 1);
     }
 }
