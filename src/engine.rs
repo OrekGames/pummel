@@ -2,12 +2,11 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use lru::LruCache;
-
 use bytes::Bytes;
+use lru::LruCache;
 use rand::RngExt;
 use serde::de::IgnoredAny;
 use tokio::sync::{Mutex, Semaphore};
@@ -582,13 +581,40 @@ fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
     })
 }
 
+fn dynamic_regex_cache() -> &'static std::sync::Mutex<LruCache<String, Arc<regex::Regex>>> {
+    static CACHE: OnceLock<std::sync::Mutex<LruCache<String, Arc<regex::Regex>>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())))
+}
+
 fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<String>> {
     if let Some(regex) = extractor.compiled_regex.as_ref() {
         return Ok(regex_capture(regex, haystack));
     }
-    let regex = regex::Regex::new(&extractor.selector)
-        .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?;
-    Ok(regex_capture(&regex, haystack))
+
+    let cache = dynamic_regex_cache();
+
+    // Fast path: Try reading from LRU and clone the Arc so we don't hold the lock during capture.
+    let cached_re = {
+        let mut cache_lock = cache.lock().unwrap();
+        cache_lock.get(&extractor.selector).cloned()
+    };
+
+    if let Some(re) = cached_re {
+        return Ok(regex_capture(&re, haystack));
+    }
+
+    // Slow path: Compile outside the lock, then insert
+    let re = Arc::new(
+        regex::Regex::new(&extractor.selector)
+            .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?,
+    );
+
+    {
+        let mut cache_lock = cache.lock().unwrap();
+        cache_lock.put(extractor.selector.clone(), re.clone());
+    }
+
+    Ok(regex_capture(&re, haystack))
 }
 
 fn run_extractor(
@@ -663,6 +689,30 @@ fn combine_run_status(current: RunStatus, next: RunStatus) -> RunStatus {
     }
 }
 
+/// Shared state for all virtual users in a scenario
+struct SharedEngineState {
+    /// HTTP client
+    http_client: Arc<dyn HttpClient>,
+
+    /// Metrics collector
+    metrics_collector: Arc<dyn MetricsCollector>,
+
+    /// Optional telemetry exporter
+    telemetry_exporter: Option<Arc<dyn TelemetryExporter>>,
+
+    /// Execution options
+    options: ExecutionOptions,
+
+    /// Optional in-flight-request cap
+    semaphore: Option<Arc<Semaphore>>,
+
+    /// Optional request-attempt start-rate limiter
+    rate_limiter: Option<Arc<RateLimiter>>,
+
+    /// Loaded data sources
+    data_sources: Arc<LoadedDataSources>,
+}
+
 /// Context for a virtual user
 struct VirtualUserContext {
     /// Virtual user ID
@@ -717,19 +767,9 @@ struct VirtualUserContext {
 
 impl VirtualUserContext {
     /// Create a new virtual user context
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        id: u32,
-        scenario: Arc<Scenario>,
-        http_client: Arc<dyn HttpClient>,
-        metrics_collector: Arc<dyn MetricsCollector>,
-        telemetry_exporter: Option<Arc<dyn TelemetryExporter>>,
-        options: ExecutionOptions,
-        semaphore: Option<Arc<Semaphore>>,
-        rate_limiter: Option<Arc<RateLimiter>>,
-        data_sources: Arc<LoadedDataSources>,
-    ) -> Self {
+    fn new(id: u32, scenario: Arc<Scenario>, shared_state: SharedEngineState) -> Self {
         let mut step_statuses = HashMap::new();
+        let mut ready_buf = Vec::new();
 
         // Initialize all steps as waiting
         for step in scenario.get_steps() {
@@ -739,21 +779,22 @@ impl VirtualUserContext {
         // Mark steps with no dependencies as ready
         for step in scenario.get_root_steps() {
             step_statuses.insert(step.id.clone(), StepStatus::Ready);
+            ready_buf.push(step.id.clone());
         }
 
         Self {
             id,
             scenario: scenario.clone(),
-            http_client,
-            metrics_collector,
-            telemetry_exporter,
+            http_client: shared_state.http_client,
+            metrics_collector: shared_state.metrics_collector,
+            telemetry_exporter: shared_state.telemetry_exporter,
             step_statuses,
-            ready_buf: Vec::new(),
-            options,
-            semaphore,
-            rate_limiter,
+            ready_buf,
+            options: shared_state.options,
+            semaphore: shared_state.semaphore,
+            rate_limiter: shared_state.rate_limiter,
             vu_context: Arc::new(Mutex::new(VuContext::new(id, scenario.id.clone()))),
-            data_sources,
+            data_sources: shared_state.data_sources,
             end_time: None,
             status: VirtualUserStatus::Waiting,
         }
@@ -770,9 +811,11 @@ impl VirtualUserContext {
         for status in self.step_statuses.values_mut() {
             *status = StepStatus::Waiting;
         }
+        self.ready_buf.clear();
         for step_id in &self.scenario.root_step_ids {
             if let Some(status) = self.step_statuses.get_mut(step_id) {
                 *status = StepStatus::Ready;
+                self.ready_buf.push(step_id.clone());
             }
         }
     }
@@ -790,16 +833,6 @@ impl VirtualUserContext {
     /// rather than `&Step` so the caller can drop the `self` borrow before the
     /// concurrent sends.
     fn take_ready_steps(&mut self) -> Vec<StepId> {
-        self.ready_buf.clear();
-
-        // Walk statuses (typically fewer Ready entries than total steps in deep
-        // DAGs) instead of scanning every scenario step.
-        for (step_id, status) in &self.step_statuses {
-            if matches!(status, StepStatus::Ready) {
-                self.ready_buf.push(step_id.clone());
-            }
-        }
-
         self.ready_buf.sort_unstable_by(|a, b| {
             let wa = self
                 .scenario
@@ -868,6 +901,7 @@ impl VirtualUserContext {
                 && let Some(status) = self.step_statuses.get_mut(&dep_step_id)
             {
                 *status = StepStatus::Ready;
+                self.ready_buf.push(dep_step_id.clone());
             }
         }
     }
@@ -1050,7 +1084,16 @@ impl VirtualUserContext {
                     break;
                 }
                 let _permit = match &semaphore {
-                    Some(sem) => Some(sem.acquire().await.unwrap()),
+                    Some(sem) => match sem.acquire().await {
+                        Ok(permit) => Some(permit),
+                        Err(err) => {
+                            last_error = Some(Error::engine(format!(
+                                "Failed to acquire semaphore permit: {}",
+                                err
+                            )));
+                            break;
+                        }
+                    },
                     None => None,
                 };
                 // Time only the send itself, starting AFTER the in-flight-request
@@ -1106,18 +1149,18 @@ impl VirtualUserContext {
                     // Record this attempt (response present so size/ttfb/status
                     // are captured on the full path) before moving `resp`.
                     if record_full {
-                        attempts.push(RequestMetrics::new(
-                            attempt_id,
-                            step.id.clone(),
-                            step.name.clone(),
-                            scenario.id.clone(),
-                            scenario.name.clone(),
-                            vu_id,
-                            &request,
-                            Some(&resp),
-                            error.clone(),
+                        attempts.push(RequestMetrics::new(crate::metrics::RequestMetricsParams {
+                            id: attempt_id,
+                            step_id: step.id.clone(),
+                            step_name: step.name.clone(),
+                            scenario_id: scenario.id.clone(),
+                            scenario_name: scenario.name.clone(),
+                            virtual_user_id: vu_id,
+                            request: &request,
+                            response: Some(&resp),
+                            error: error.clone(),
                             elapsed,
-                        ));
+                        }));
                     } else if use_summary
                         && let Err(err) = metrics_collector
                             .record_attempt_summary(AttemptSummary {
@@ -1149,18 +1192,18 @@ impl VirtualUserContext {
                 Ok(Err(err)) => {
                     // Transport error: no response, but real elapsed is recorded.
                     if record_full {
-                        attempts.push(RequestMetrics::new(
-                            attempt_id,
-                            step.id.clone(),
-                            step.name.clone(),
-                            scenario.id.clone(),
-                            scenario.name.clone(),
-                            vu_id,
-                            &request,
-                            None,
-                            Some(err.to_string()),
+                        attempts.push(RequestMetrics::new(crate::metrics::RequestMetricsParams {
+                            id: attempt_id,
+                            step_id: step.id.clone(),
+                            step_name: step.name.clone(),
+                            scenario_id: scenario.id.clone(),
+                            scenario_name: scenario.name.clone(),
+                            virtual_user_id: vu_id,
+                            request: &request,
+                            response: None,
+                            error: Some(err.to_string()),
                             elapsed,
-                        ));
+                        }));
                     } else if use_summary
                         && let Err(record_err) = metrics_collector
                             .record_attempt_summary(AttemptSummary {
@@ -1186,18 +1229,18 @@ impl VirtualUserContext {
                     // the retry loop treat it like any other failure.
                     let msg = format!("step '{}' timed out after {:?}", step.id, step.timeout);
                     if record_full {
-                        attempts.push(RequestMetrics::new(
-                            attempt_id,
-                            step.id.clone(),
-                            step.name.clone(),
-                            scenario.id.clone(),
-                            scenario.name.clone(),
-                            vu_id,
-                            &request,
-                            None,
-                            Some(msg.clone()),
+                        attempts.push(RequestMetrics::new(crate::metrics::RequestMetricsParams {
+                            id: attempt_id,
+                            step_id: step.id.clone(),
+                            step_name: step.name.clone(),
+                            scenario_id: scenario.id.clone(),
+                            scenario_name: scenario.name.clone(),
+                            virtual_user_id: vu_id,
+                            request: &request,
+                            response: None,
+                            error: Some(msg.clone()),
                             elapsed,
-                        ));
+                        }));
                     } else if use_summary
                         && let Err(err) = metrics_collector
                             .record_attempt_summary(AttemptSummary {
@@ -1674,18 +1717,19 @@ impl Engine {
                     },
                 };
 
-                // Create a virtual user context
-                let mut context = VirtualUserContext::new(
-                    i,
-                    scenario_clone,
+                // Create shared engine state
+                let shared_state = SharedEngineState {
                     http_client,
-                    metrics_collector_clone,
-                    telemetry_exporter_clone,
-                    options_clone,
-                    request_semaphore_clone,
-                    rate_limiter_clone,
-                    data_sources_clone,
-                );
+                    metrics_collector: metrics_collector_clone,
+                    telemetry_exporter: telemetry_exporter_clone,
+                    options: options_clone,
+                    semaphore: request_semaphore_clone,
+                    rate_limiter: rate_limiter_clone,
+                    data_sources: data_sources_clone,
+                };
+
+                // Create a virtual user context
+                let mut context = VirtualUserContext::new(i, scenario_clone, shared_state);
 
                 context.run(deadline).await
             });
