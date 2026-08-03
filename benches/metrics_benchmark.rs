@@ -58,18 +58,18 @@ fn create_test_metrics(
         .map(|r| r.response_time())
         .unwrap_or_default();
 
-    RequestMetrics::new(
-        Uuid::new_v4().to_string(),
-        step_id.to_string(),
-        step_id.to_string(),
-        scenario_id.to_string(),
-        scenario_id.to_string(),
+    RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+        id: Uuid::new_v4().to_string(),
+        step_id: step_id.to_string(),
+        step_name: step_id.to_string(),
+        scenario_id: scenario_id.to_string(),
+        scenario_name: scenario_id.to_string(),
         virtual_user_id,
-        &request,
-        response.as_ref(),
+        request: &request,
+        response: response.as_ref(),
         error,
         elapsed,
-    )
+    })
 }
 
 // Benchmark single-threaded recording of metrics
@@ -342,72 +342,72 @@ fn bench_request_metrics_construct(c: &mut Criterion) {
 
     group.bench_function("success_binary_1k", |b| {
         b.iter(|| {
-            let metrics = RequestMetrics::new(
-                black_box(id).to_string(),
-                black_box(step_id).to_string(),
-                black_box(step_name).to_string(),
-                black_box(scenario_id).to_string(),
-                black_box(scenario_name).to_string(),
-                black_box(1u32),
-                black_box(&request),
-                Some(black_box(&binary_resp)),
-                None,
-                black_box(elapsed),
-            );
+            let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                id: black_box(id).to_string(),
+                step_id: black_box(step_id).to_string(),
+                step_name: black_box(step_name).to_string(),
+                scenario_id: black_box(scenario_id).to_string(),
+                scenario_name: black_box(scenario_name).to_string(),
+                virtual_user_id: black_box(1u32),
+                request: black_box(&request),
+                response: Some(black_box(&binary_resp)),
+                error: None,
+                elapsed: black_box(elapsed),
+            });
             black_box(metrics)
         });
     });
 
     group.bench_function("success_text_1k", |b| {
         b.iter(|| {
-            let metrics = RequestMetrics::new(
-                black_box(id).to_string(),
-                black_box(step_id).to_string(),
-                black_box(step_name).to_string(),
-                black_box(scenario_id).to_string(),
-                black_box(scenario_name).to_string(),
-                black_box(1u32),
-                black_box(&request),
-                Some(black_box(&text_resp)),
-                None,
-                black_box(elapsed),
-            );
+            let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                id: black_box(id).to_string(),
+                step_id: black_box(step_id).to_string(),
+                step_name: black_box(step_name).to_string(),
+                scenario_id: black_box(scenario_id).to_string(),
+                scenario_name: black_box(scenario_name).to_string(),
+                virtual_user_id: black_box(1u32),
+                request: black_box(&request),
+                response: Some(black_box(&text_resp)),
+                error: None,
+                elapsed: black_box(elapsed),
+            });
             black_box(metrics)
         });
     });
 
     group.bench_function("success_json_nested", |b| {
         b.iter(|| {
-            let metrics = RequestMetrics::new(
-                black_box(id).to_string(),
-                black_box(step_id).to_string(),
-                black_box(step_name).to_string(),
-                black_box(scenario_id).to_string(),
-                black_box(scenario_name).to_string(),
-                black_box(1u32),
-                black_box(&request),
-                Some(black_box(&json_resp)),
-                None,
-                black_box(elapsed),
-            );
+            let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                id: black_box(id).to_string(),
+                step_id: black_box(step_id).to_string(),
+                step_name: black_box(step_name).to_string(),
+                scenario_id: black_box(scenario_id).to_string(),
+                scenario_name: black_box(scenario_name).to_string(),
+                virtual_user_id: black_box(1u32),
+                request: black_box(&request),
+                response: Some(black_box(&json_resp)),
+                error: None,
+                elapsed: black_box(elapsed),
+            });
             black_box(metrics)
         });
     });
 
     group.bench_function("failure_no_response", |b| {
         b.iter(|| {
-            let metrics = RequestMetrics::new(
-                black_box(id).to_string(),
-                black_box(step_id).to_string(),
-                black_box(step_name).to_string(),
-                black_box(scenario_id).to_string(),
-                black_box(scenario_name).to_string(),
-                black_box(1u32),
-                black_box(&request),
-                None,
-                Some(black_box("connection refused").to_string()),
-                black_box(elapsed),
-            );
+            let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                id: black_box(id).to_string(),
+                step_id: black_box(step_id).to_string(),
+                step_name: black_box(step_name).to_string(),
+                scenario_id: black_box(scenario_id).to_string(),
+                scenario_name: black_box(scenario_name).to_string(),
+                virtual_user_id: black_box(1u32),
+                request: black_box(&request),
+                response: None,
+                error: Some(black_box("connection refused").to_string()),
+                elapsed: black_box(elapsed),
+            });
             black_box(metrics)
         });
     });
