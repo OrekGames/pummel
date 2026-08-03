@@ -823,4 +823,15 @@ mod tests {
         source = source.access(DataAccessMode::PerVu);
         assert_eq!(source.access, DataAccessMode::PerVu);
     }
+
+    #[test]
+    fn test_data_source_seed() {
+        let source = DataSource::csv("test.csv").seed(12345);
+        assert_eq!(source.seed, Some(12345));
+
+        let source2 = DataSource::json("test.json").seed(999);
+        assert_eq!(source2.seed, Some(999));
+        assert_eq!(source2.kind, DataSourceKind::Json);
+        assert_eq!(source2.path, "test.json");
+    }
 }
