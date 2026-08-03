@@ -59,18 +59,18 @@ fn bench_full_vs_summary(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let collector = InMemoryMetricsCollector::new();
-                let metrics = RequestMetrics::new(
-                    Uuid::new_v4().to_string(),
-                    "step_get".to_string(),
-                    "Get Items".to_string(),
-                    "scenario_main".to_string(),
-                    "Main Scenario".to_string(),
-                    7,
-                    black_box(&request),
-                    Some(black_box(&response)),
-                    None,
+                let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                    id: Uuid::new_v4().to_string(),
+                    step_id: "step_get".to_string(),
+                    step_name: "Get Items".to_string(),
+                    scenario_id: "scenario_main".to_string(),
+                    scenario_name: "Main Scenario".to_string(),
+                    virtual_user_id: 7,
+                    request: black_box(&request),
+                    response: Some(black_box(&response)),
+                    error: None,
                     elapsed,
-                );
+                });
                 collector
                     .record_request(black_box(metrics))
                     .await
@@ -127,18 +127,18 @@ fn bench_noop_construct_vs_skip(c: &mut Criterion) {
             rt.block_on(async {
                 let collector = NoopMetricsCollector::new();
                 assert!(!collector.records_requests());
-                let metrics = RequestMetrics::new(
-                    Uuid::new_v4().to_string(),
-                    "step_get".to_string(),
-                    "Get Items".to_string(),
-                    "scenario_main".to_string(),
-                    "Main Scenario".to_string(),
-                    7,
-                    black_box(&request),
-                    Some(black_box(&response)),
-                    None,
+                let metrics = RequestMetrics::new(pummel::metrics::RequestMetricsParams {
+                    id: Uuid::new_v4().to_string(),
+                    step_id: "step_get".to_string(),
+                    step_name: "Get Items".to_string(),
+                    scenario_id: "scenario_main".to_string(),
+                    scenario_name: "Main Scenario".to_string(),
+                    virtual_user_id: 7,
+                    request: black_box(&request),
+                    response: Some(black_box(&response)),
+                    error: None,
                     elapsed,
-                );
+                });
                 collector
                     .record_request(black_box(metrics))
                     .await
