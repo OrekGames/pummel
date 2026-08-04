@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -581,9 +581,11 @@ fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
     })
 }
 
-fn dynamic_regex_cache() -> &'static std::sync::Mutex<LruCache<String, Arc<regex::Regex>>> {
-    static CACHE: OnceLock<std::sync::Mutex<LruCache<String, Arc<regex::Regex>>>> = OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())))
+thread_local! {
+    // ⚡ Bolt Optimization: Use a thread-local cache to eliminate lock contention on the hot path
+    // when dynamically compiling or matching regexes in extractors across many virtual users.
+    static EXTRACTOR_REGEX_CACHE: std::cell::RefCell<LruCache<String, Arc<regex::Regex>>> =
+        std::cell::RefCell::new(LruCache::new(NonZeroUsize::new(1024).unwrap()));
 }
 
 fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<String>> {
@@ -591,28 +593,23 @@ fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<S
         return Ok(regex_capture(regex, haystack));
     }
 
-    let cache = dynamic_regex_cache();
-
-    // Fast path: Try reading from LRU and clone the Arc so we don't hold the lock during capture.
-    let cached_re = {
-        let mut cache_lock = cache.lock().unwrap();
-        cache_lock.get(&extractor.selector).cloned()
-    };
+    let cached_re =
+        EXTRACTOR_REGEX_CACHE.with(|cache| cache.borrow_mut().get(&extractor.selector).cloned());
 
     if let Some(re) = cached_re {
         return Ok(regex_capture(&re, haystack));
     }
 
-    // Slow path: Compile outside the lock, then insert
     let re = Arc::new(
         regex::Regex::new(&extractor.selector)
             .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?,
     );
 
-    {
-        let mut cache_lock = cache.lock().unwrap();
-        cache_lock.put(extractor.selector.clone(), re.clone());
-    }
+    EXTRACTOR_REGEX_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .put(extractor.selector.clone(), re.clone());
+    });
 
     Ok(regex_capture(&re, haystack))
 }
