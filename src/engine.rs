@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -581,40 +581,39 @@ fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
     })
 }
 
-fn dynamic_regex_cache() -> &'static std::sync::Mutex<LruCache<String, Arc<regex::Regex>>> {
-    static CACHE: OnceLock<std::sync::Mutex<LruCache<String, Arc<regex::Regex>>>> = OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())))
-}
-
 fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<String>> {
     if let Some(regex) = extractor.compiled_regex.as_ref() {
         return Ok(regex_capture(regex, haystack));
     }
 
-    let cache = dynamic_regex_cache();
-
-    // Fast path: Try reading from LRU and clone the Arc so we don't hold the lock during capture.
-    let cached_re = {
-        let mut cache_lock = cache.lock().unwrap();
-        cache_lock.get(&extractor.selector).cloned()
-    };
-
-    if let Some(re) = cached_re {
-        return Ok(regex_capture(&re, haystack));
+    // PERFORMANCE OPTIMIZATION (⚡ Bolt):
+    // Previously used a global Mutex-protected LruCache which caused massive lock contention
+    // on the hot path when multiple concurrent Virtual Users executed extractors.
+    // By using a thread_local cache, we completely eliminate lock contention.
+    // Since this is a synchronous function with no await points, RefCell is safe.
+    thread_local! {
+        static EXTRACTOR_REGEX_CACHE: RefCell<LruCache<String, regex::Regex>> = RefCell::new(
+            LruCache::new(NonZeroUsize::new(1024).unwrap())
+        );
     }
 
-    // Slow path: Compile outside the lock, then insert
-    let re = Arc::new(
-        regex::Regex::new(&extractor.selector)
-            .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?,
-    );
+    EXTRACTOR_REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
 
-    {
-        let mut cache_lock = cache.lock().unwrap();
-        cache_lock.put(extractor.selector.clone(), re.clone());
-    }
+        // Fast path: Try reading from LRU
+        if let Some(re) = cache.get(&extractor.selector) {
+            return Ok(regex_capture(re, haystack));
+        }
 
-    Ok(regex_capture(&re, haystack))
+        // Slow path: Compile, then insert
+        let re = regex::Regex::new(&extractor.selector)
+            .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?;
+
+        let captured = regex_capture(&re, haystack);
+        cache.put(extractor.selector.clone(), re);
+
+        Ok(captured)
+    })
 }
 
 fn run_extractor(
