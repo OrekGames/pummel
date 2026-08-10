@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,11 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-
-use lru::LruCache;
 
 use crate::error::{Error, Result};
 
@@ -542,20 +539,18 @@ pub fn extract_relative_json_path(value: &Value, path: &str) -> Option<Value> {
 
 fn cached_relative_json_path_tokens(path: &str) -> Option<Arc<Vec<JsonPathToken>>> {
     thread_local! {
-        // Prevent DoS memory exhaustion with a bounded cache per thread
-        static PATH_TOKEN_CACHE: RefCell<LruCache<String, Arc<Vec<JsonPathToken>>>> = RefCell::new(
-            LruCache::new(NonZeroUsize::new(1024).unwrap())
+        static CACHE: RefCell<lru::LruCache<String, Arc<Vec<JsonPathToken>>>> = RefCell::new(
+            lru::LruCache::new(NonZeroUsize::new(1000).unwrap())
         );
     }
-
-    PATH_TOKEN_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(existing) = cache.get(path) {
+    CACHE.with(|cache| {
+        if let Some(existing) = cache.borrow_mut().get(path) {
             return Some(Arc::clone(existing));
         }
-
         let tokens = Arc::new(parse_relative_json_path(path).ok()?);
-        cache.put(path.to_string(), Arc::clone(&tokens));
+        cache
+            .borrow_mut()
+            .put(path.to_string(), Arc::clone(&tokens));
         Some(tokens)
     })
 }
