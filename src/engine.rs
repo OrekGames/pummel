@@ -1517,8 +1517,9 @@ impl VirtualUserContext {
             }
 
             // (5) Pace before the next iteration, never sleeping past the
-            //     deadline.
-            if self.options.think_time.as_millis() > 0 {
+            //     deadline. Think time is closed-loop only; open-loop pacing is
+            //     owned by `target_rps` / the rate limiter.
+            if self.options.target_rps.is_none() && self.options.think_time.as_millis() > 0 {
                 // Closed-loop: think between sessions, but not past the deadline.
                 if now + self.options.think_time >= deadline {
                     break;
