@@ -770,17 +770,19 @@ struct VirtualUserContext {
 impl VirtualUserContext {
     /// Create a new virtual user context
     fn new(id: u32, scenario: Arc<Scenario>, shared_state: SharedEngineState) -> Self {
-        let mut step_statuses = HashMap::new();
-        let mut ready_buf = Vec::new();
+        let mut step_statuses = HashMap::with_capacity(scenario.get_steps().len());
+        let mut ready_buf = Vec::with_capacity(scenario.get_root_steps().len());
 
         // Initialize all steps as waiting
         for step in scenario.get_steps() {
             step_statuses.insert(step.id.clone(), StepStatus::Waiting);
         }
 
-        // Mark steps with no dependencies as ready
+        // Mark steps with no dependencies as ready (update in-place to avoid duplicate cloning)
         for step in scenario.get_root_steps() {
-            step_statuses.insert(step.id.clone(), StepStatus::Ready);
+            if let Some(status) = step_statuses.get_mut(&step.id) {
+                *status = StepStatus::Ready;
+            }
             ready_buf.push(step.id.clone());
         }
 
