@@ -91,9 +91,40 @@ jobs:
           bash -n scripts/install.sh
           bash scripts/tests/installer_harness.sh
 
+  # Mirror ci.yml installer-checks-windows so tagged releases cannot ship a
+  # broken install.ps1 / harness that only Linux bash checks would miss.
+  installer-checks-windows:
+    name: installer-checks-windows
+    needs: validate-tag
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Parse install.ps1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            "$env:GITHUB_WORKSPACE/scripts/install.ps1",
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
+      - name: Run PowerShell installer harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:GITHUB_WORKSPACE/scripts/tests/installer_harness.ps1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   build-linux:
     name: build-linux
-    needs: [validate-tag, quality-gates]
+    needs: [validate-tag, quality-gates, installer-checks-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -125,7 +156,7 @@ jobs:
 
   build-macos-intel:
     name: build-macos-intel
-    needs: [validate-tag, quality-gates]
+    needs: [validate-tag, quality-gates, installer-checks-windows]
     runs-on: macos-13
     steps:
       - name: Checkout
@@ -155,7 +186,7 @@ jobs:
 
   build-macos-arm:
     name: build-macos-arm
-    needs: [validate-tag, quality-gates]
+    needs: [validate-tag, quality-gates, installer-checks-windows]
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -185,7 +216,7 @@ jobs:
 
   build-windows:
     name: build-windows
-    needs: [validate-tag, quality-gates]
+    needs: [validate-tag, quality-gates, installer-checks-windows]
     runs-on: windows-latest
     steps:
       - name: Checkout
