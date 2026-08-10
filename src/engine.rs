@@ -415,33 +415,43 @@ fn branch_matches(
     ctx: &VuContext,
     step_id: &str,
     branch: &crate::scenario::BranchCondition,
-) -> bool {
+) -> Result<bool> {
     let value = resolve_branch_value(ctx, step_id, &branch.variable);
     match branch.operator {
-        BranchOperator::Exists => value.is_some(),
-        BranchOperator::Equals => match (value, &branch.value) {
+        BranchOperator::Exists => Ok(value.is_some()),
+        BranchOperator::Equals => Ok(match (value, &branch.value) {
             (Some(value), Some(expected)) => value_to_template_string(&value) == *expected,
             _ => false,
-        },
-        BranchOperator::NotEquals => match (value, &branch.value) {
+        }),
+        BranchOperator::NotEquals => Ok(match (value, &branch.value) {
             (Some(value), Some(expected)) => value_to_template_string(&value) != *expected,
             _ => false,
-        },
+        }),
         BranchOperator::GreaterThan => {
-            numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a > b)
+            Ok(numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| {
+                a > b
+            }))
         }
         BranchOperator::GreaterThanOrEqual => {
-            numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a >= b)
+            Ok(numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| {
+                a >= b
+            }))
         }
-        BranchOperator::LessThan => numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a < b),
+        BranchOperator::LessThan => {
+            Ok(numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| {
+                a < b
+            }))
+        }
         BranchOperator::LessThanOrEqual => {
-            numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a <= b)
+            Ok(numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| {
+                a <= b
+            }))
         }
         BranchOperator::MatchesRegex => match value {
             Some(value) => {
                 let haystack = value_to_template_string(&value);
                 if let Some(regex) = branch.compiled_regex.as_ref() {
-                    regex.is_match(&haystack)
+                    Ok(regex.is_match(&haystack))
                 } else if let Some(pattern) = &branch.value {
                     thread_local! {
                         static REGEX_CACHE: RefCell<LruCache<String, regex::Regex>> = RefCell::new(
@@ -452,22 +462,28 @@ fn branch_matches(
                     REGEX_CACHE.with(|cache| {
                         let mut cache = cache.borrow_mut();
                         if let Some(regex) = cache.get(pattern) {
-                            return regex.is_match(&haystack);
+                            return Ok(regex.is_match(&haystack));
                         }
 
-                        if let Ok(regex) = regex::Regex::new(pattern) {
-                            let is_match = regex.is_match(&haystack);
-                            cache.put(pattern.clone(), regex);
-                            is_match
-                        } else {
-                            false
+                        match regex::Regex::new(pattern) {
+                            Ok(regex) => {
+                                let is_match = regex.is_match(&haystack);
+                                cache.put(pattern.clone(), regex);
+                                Ok(is_match)
+                            }
+                            // Fail closed: invalid regex must not silently skip.
+                            Err(e) => Err(Error::validation(format!(
+                                "invalid branch regex '{pattern}': {e}"
+                            ))),
                         }
                     })
                 } else {
-                    false
+                    Err(Error::validation(
+                        "MatchesRegex branch requires a pattern".to_string(),
+                    ))
                 }
             }
-            None => false,
+            None => Ok(false),
         },
     }
 }
@@ -563,6 +579,10 @@ fn render_request(
                 if !has_content_type {
                     builder = builder.header("Content-Type", "application/json");
                 }
+            }
+            DynamicBodyTemplate::Binary(bytes) => {
+                // Opaque bytes: no template rendering; preserve exact payload.
+                builder = builder.binary(bytes.clone());
             }
         }
     }
@@ -972,14 +992,26 @@ impl VirtualUserContext {
 
         if let Some(branch) = &step.branch {
             let ctx = vu_context.lock().unwrap();
-            if !branch_matches(&ctx, &step.id, branch) {
-                return StepOutcome {
-                    step_id,
-                    success: true,
-                    skipped: true,
-                    truncated: false,
-                    error: None,
-                };
+            match branch_matches(&ctx, &step.id, branch) {
+                Ok(false) => {
+                    return StepOutcome {
+                        step_id,
+                        success: true,
+                        skipped: true,
+                        truncated: false,
+                        error: None,
+                    };
+                }
+                Ok(true) => {}
+                Err(err) => {
+                    return StepOutcome {
+                        step_id,
+                        success: false,
+                        skipped: false,
+                        truncated: false,
+                        error: Some(err),
+                    };
+                }
             }
         }
 

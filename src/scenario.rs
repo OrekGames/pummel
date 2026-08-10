@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::data::{DataSource, JsonPathToken, parse_json_path};
@@ -79,6 +80,8 @@ pub enum DynamicBodyTemplate {
     Text(String),
     /// Render, then parse as JSON.
     Json(String),
+    /// Opaque binary payload preserved verbatim (no template rendering).
+    Binary(Bytes),
 }
 
 /// Runtime-rendered request fields for dynamic scenarios.
@@ -124,7 +127,8 @@ impl DynamicRequestSpec {
                         .ok()
                         .map(DynamicBodyTemplate::Json)
                 } else {
-                    None
+                    // Preserve non-JSON binary payloads exactly (G2-3).
+                    Some(DynamicBodyTemplate::Binary(bytes.clone()))
                 }
             }
         };
@@ -393,6 +397,10 @@ impl BranchCondition {
     }
 
     /// Create a regex branch condition.
+    ///
+    /// Invalid patterns are not compiled here; prefer [`Self::try_matches_regex`]
+    /// or rely on [`Scenario::validate`], which rejects invalid `MatchesRegex`
+    /// patterns (fail closed).
     pub fn matches_regex<S: Into<String>, V: Into<String>>(variable: S, pattern: V) -> Self {
         let value = pattern.into();
         let compiled_regex = regex::Regex::new(&value).ok();
@@ -402,6 +410,22 @@ impl BranchCondition {
             value: Some(value),
             compiled_regex,
         }
+    }
+
+    /// Create a regex branch condition, failing if the pattern does not compile.
+    pub fn try_matches_regex<S: Into<String>, V: Into<String>>(
+        variable: S,
+        pattern: V,
+    ) -> Result<Self> {
+        let value = pattern.into();
+        let compiled_regex = regex::Regex::new(&value)
+            .map_err(|e| Error::validation(format!("invalid branch regex: {e}")))?;
+        Ok(Self {
+            variable: variable.into(),
+            operator: BranchOperator::MatchesRegex,
+            value: Some(value),
+            compiled_regex: Some(compiled_regex),
+        })
     }
 }
 
@@ -1045,7 +1069,94 @@ impl Scenario {
             }
         }
 
+        // Fail closed on invalid MatchesRegex patterns (programmatic path).
+        for step in self.steps.values() {
+            if let Some(branch) = &step.branch
+                && branch.operator == BranchOperator::MatchesRegex
+            {
+                match &branch.value {
+                    Some(pattern) if branch.compiled_regex.is_none() => {
+                        if let Err(e) = regex::Regex::new(pattern) {
+                            return Err(Error::scenario(format!(
+                                "Step '{}' has invalid MatchesRegex pattern: {e}",
+                                step.id
+                            )));
+                        }
+                    }
+                    None => {
+                        return Err(Error::scenario(format!(
+                            "Step '{}' MatchesRegex branch requires a pattern",
+                            step.id
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Reject extractor variable names that can race across concurrent steps.
+        self.validate_concurrent_extractor_names()?;
+
         Ok(())
+    }
+
+    /// Reject duplicate extractor variable names on steps with no dependency
+    /// ordering (they can run in the same ready-wave and race on `insert_var`).
+    fn validate_concurrent_extractor_names(&self) -> Result<()> {
+        let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
+        for step in self.steps.values() {
+            for extractor in &step.extractors {
+                owners
+                    .entry(extractor.name.as_str())
+                    .or_default()
+                    .push(step.id.as_str());
+            }
+        }
+
+        for (name, step_ids) in owners {
+            if step_ids.len() < 2 {
+                continue;
+            }
+            for i in 0..step_ids.len() {
+                for j in (i + 1)..step_ids.len() {
+                    let a = step_ids[i];
+                    let b = step_ids[j];
+                    if a == b {
+                        // Same step: extractors run sequentially in declaration
+                        // order, so duplicates are last-writer-wins, not a race.
+                        continue;
+                    }
+                    let ordered = self.step_depends_on(a, b) || self.step_depends_on(b, a);
+                    if !ordered {
+                        return Err(Error::scenario(format!(
+                            "Extractor variable '{name}' is written by concurrent steps '{a}' and '{b}' (no dependency ordering)"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True when `step_id` transitively lists `target` among its dependencies.
+    fn step_depends_on(&self, step_id: &str, target: &str) -> bool {
+        let mut stack = vec![step_id];
+        let mut visited = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id.to_string()) {
+                continue;
+            }
+            let Some(step) = self.steps.get(id) else {
+                continue;
+            };
+            for dep in &step.dependencies {
+                if dep == target {
+                    return true;
+                }
+                stack.push(dep.as_str());
+            }
+        }
+        false
     }
 
     /// Check for cycles in the dependency graph
