@@ -817,10 +817,14 @@ impl VirtualUserContext {
             *status = StepStatus::Waiting;
         }
         self.ready_buf.clear();
-        for step_id in &self.scenario.root_step_ids {
-            if let Some(status) = self.step_statuses.get_mut(step_id) {
+        // Prefer the same root resolution as VU startup (`get_root_steps`),
+        // including its cache-miss fallback when `root_step_ids` is stale/empty
+        // after an embedder mutated `Scenario.steps` without rebuilding caches.
+        for step in self.scenario.get_root_steps() {
+            let step_id = step.id.clone();
+            if let Some(status) = self.step_statuses.get_mut(&step_id) {
                 *status = StepStatus::Ready;
-                self.ready_buf.push(step_id.clone());
+                self.ready_buf.push(step_id);
             }
         }
     }
@@ -1904,13 +1908,18 @@ impl Engine {
             return Err(Error::config("target_rps must be finite and positive"));
         }
 
-        // Validate every scenario before running so that an invalid, cyclic, or
-        // self-dependent graph (constructable by embedders that bypass
-        // ScenarioBuilder) fails loudly instead of hanging VUs until timeout.
+        // Clone + rebuild scheduling caches at the run boundary so embedders that
+        // mutate `Scenario.steps` after `add_scenario` (bypassing `add_step` /
+        // builder finalize) cannot leave empty/stale `root_step_ids` and spin
+        // silent zero-work VU iterations. Validation runs on the rebuilt clone.
+        let mut prepared_scenarios = Vec::with_capacity(self.scenarios.len());
         for scenario in self.scenarios.values() {
+            let mut scenario = (**scenario).clone();
+            scenario.rebuild_scheduling_cache();
             scenario.validate().map_err(|e| {
                 Error::scenario(format!("Scenario '{}' is invalid: {e}", scenario.id))
             })?;
+            prepared_scenarios.push(Arc::new(scenario));
         }
 
         // Telemetry lifecycle: if an exporter is attached, initialize
@@ -1930,10 +1939,10 @@ impl Engine {
 
         // Create a vector to hold the futures for all scenario executions
         let mut scenario_futures = Vec::new();
-        let scenario_count = self.scenarios.len().max(1);
+        let scenario_count = prepared_scenarios.len().max(1);
 
         // Prepare futures for each scenario
-        for scenario in self.scenarios.values() {
+        for scenario in prepared_scenarios {
             // Create options for this scenario
             let split_target_rps = options
                 .target_rps
@@ -1949,16 +1958,11 @@ impl Engine {
 
             // Create a future for running this scenario
             let engine_ref = self.clone();
-            let scenario_clone = scenario.clone();
             let metrics_collector_clone = metrics_collector.clone();
 
             let future = tokio::spawn(async move {
                 engine_ref
-                    .run_scenario_with_profile(
-                        scenario_clone,
-                        scenario_options,
-                        metrics_collector_clone,
-                    )
+                    .run_scenario_with_profile(scenario, scenario_options, metrics_collector_clone)
                     .await
             });
 

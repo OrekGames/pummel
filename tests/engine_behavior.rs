@@ -326,6 +326,77 @@ async fn proof5_invalid_scenario_rejected_missing_dependency() {
 }
 
 // ---------------------------------------------------------------------------
+// B1-5: direct `Scenario.steps` mutation without `rebuild_scheduling_cache`
+// must still execute a root + dependent graph across sustained iterations.
+// `run_all` clones and rebuilds scheduling caches before execution.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn proof6_direct_steps_mutation_rebuilds_cache_for_sustained_load() {
+    let sends = Arc::new(AtomicUsize::new(0));
+    let sends_for_factory = sends.clone();
+
+    let mut engine = Engine::new();
+    engine.with_http_client_factory(move || {
+        Ok(Arc::new(CountingSlowClient {
+            sends: sends_for_factory.clone(),
+            per_send: Duration::from_millis(2),
+        }) as Arc<dyn HttpClient>)
+    });
+    engine.with_metrics_collector_factory(MetricsCollectorFactory::create_in_memory);
+
+    // Bypass add_step / ScenarioBuilder so root_step_ids and dependents stay empty.
+    let mut scenario = Scenario::new("mutated", "Mutated");
+    let root = StepBuilder::new(
+        "root",
+        "Root",
+        Request::get("https://example.com/root").build().unwrap(),
+    )
+    .max_retries(0)
+    .build();
+    let child = StepBuilder::new(
+        "child",
+        "Child",
+        Request::get("https://example.com/child").build().unwrap(),
+    )
+    .max_retries(0)
+    .dependency("root")
+    .build();
+    scenario.steps.insert(root.id.clone(), root);
+    scenario.steps.insert(child.id.clone(), child);
+    // Intentionally skip `add_step` / `rebuild_scheduling_cache` so caches stay
+    // empty until `run_all` rebuilds them.
+    scenario.virtual_users = 1;
+    scenario.duration = Duration::from_millis(250);
+    scenario.ramp_up = Duration::from_secs(0);
+    scenario.think_time = Duration::from_secs(0);
+
+    engine.add_scenario(scenario);
+
+    let results = engine
+        .run_all(
+            ExecutionOptions::builder()
+                .virtual_users(1)
+                .duration(Duration::from_millis(250))
+                .ramp_up(Duration::from_secs(0))
+                .think_time(Duration::from_secs(0))
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let count = sends.load(Ordering::SeqCst);
+    // Each full iteration runs root + child (2 sends). Sustained load over 250ms
+    // must produce multiple iterations; an empty cache would spin zero-work
+    // passes (0 sends). A final truncated mid-pass may leave an odd count.
+    assert!(
+        count >= 4,
+        "expected root+child work across sustained iterations; got {count} sends"
+    );
+    assert!(results.total_requests >= 4);
+}
+
+// ---------------------------------------------------------------------------
 
 fn default_options() -> ExecutionOptions {
     ExecutionOptions::builder()
