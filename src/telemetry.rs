@@ -414,9 +414,10 @@ pub struct TelemetryExporterFactory;
 impl TelemetryExporterFactory {
     /// Create a telemetry exporter for the requested format.
     ///
-    /// Implemented formats return a real exporter; `OpenTelemetry`/`Prometheus`
-    /// return an [`Error::telemetry`] so a config-driven choice fails loudly
-    /// instead of silently no-opping (explicit exporter choice fails loudly).
+    /// Implemented formats return a real exporter. `OpenTelemetry`/`Prometheus`
+    /// return an [`Error::telemetry`] for direct/programmatic factory use.
+    /// File-based `[telemetry]` configs with those exporters are rejected
+    /// earlier by [`crate::config::Config::validate`] when telemetry is enabled.
     pub fn create(config: &ExporterConfig) -> Result<Arc<dyn TelemetryExporter>> {
         match config.format {
             TelemetryFormat::Json => Ok(Arc::new(JsonTelemetryExporter::new())),

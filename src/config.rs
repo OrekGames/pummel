@@ -231,6 +231,11 @@ impl Config {
         for (step_id, step) in &self.steps {
             validate_headers(&format!("steps.{step_id}.headers"), &step.headers)?;
             validate_template(&format!("steps.{step_id}.url"), &step.url)?;
+            if step.body.is_some() && step.json.is_some() {
+                return Err(Error::config(format!(
+                    "Step '{step_id}' cannot set both 'body' and 'json'; choose one request body form"
+                )));
+            }
             if let Some(body) = &step.body {
                 validate_template(&format!("steps.{step_id}.body"), body)?;
             }
@@ -650,11 +655,13 @@ pub struct StepConfig {
     #[serde(default)]
     pub headers: HashMap<String, String>,
 
-    /// Request body as text
+    /// Request body as text. Mutually exclusive with [`Self::json`];
+    /// [`Config::validate`] rejects steps that set both.
     #[serde(default)]
     pub body: Option<String>,
 
-    /// Request body as JSON
+    /// Request body as JSON. Mutually exclusive with [`Self::body`];
+    /// [`Config::validate`] rejects steps that set both.
     #[serde(default)]
     pub json: Option<String>,
 
@@ -877,8 +884,11 @@ pub struct TelemetryConfig {
     pub enabled: bool,
 
     /// Exporter type. Implemented: `json` (newline-delimited JSON to stderr),
-    /// `console`, `noop`. `otlp`/`prometheus` are accepted but currently error
-    /// at build time (not yet implemented).
+    /// `console`, `noop`/`none`. When [`Self::enabled`] is `true`,
+    /// [`Config::validate`] rejects unimplemented exporters such as `otlp` and
+    /// `prometheus` up front. Direct programmatic construction via
+    /// [`crate::telemetry::TelemetryExporterFactory::create`] still returns a
+    /// factory/`Error::telemetry` for those formats.
     #[serde(default = "default_exporter_type")]
     pub exporter: String,
 
@@ -2232,6 +2242,58 @@ global:
         assert_eq!(
             reparsed.steps.get("a").unwrap().url,
             original.steps.get("a").unwrap().url
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_step_with_both_body_and_json_toml() {
+        let config = Config::from_toml_str(
+            r#"
+            [scenarios.s]
+            name = "S"
+            steps = ["a"]
+
+            [steps.a]
+            name = "A"
+            method = "POST"
+            url = "https://example.com/api"
+            body = "plain text"
+            json = '{"key":"value"}'
+            "#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("Step 'a'") && err.contains("both 'body' and 'json'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_step_with_both_body_and_json_yaml() {
+        let config = Config::from_yaml_str(
+            r#"
+scenarios:
+  s:
+    name: "S"
+    steps: ["a"]
+
+steps:
+  a:
+    name: "A"
+    method: "POST"
+    url: "https://example.com/api"
+    body: "plain text"
+    json: '{"key":"value"}'
+"#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("Step 'a'") && err.contains("both 'body' and 'json'"),
+            "unexpected error: {err}"
         );
     }
 
