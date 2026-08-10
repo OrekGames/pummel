@@ -1900,7 +1900,25 @@ impl Engine {
         Ok(combined)
     }
 
-    /// Run all scenarios with the given configuration
+    /// Convenience entry point: validate/build scenarios from `config`, wire
+    /// factories via [`Self::apply_config`], then [`Self::run_all`].
+    ///
+    /// # Capability matrix vs CLI / `apply_config` + `run_all`
+    ///
+    /// | Capability | `Engine::run(&Config)` | CLI / `apply_config` + `run_all` |
+    /// |---|---|---|
+    /// | Load `[http]` / `[metrics]` / `[telemetry]` via `apply_config` | yes | yes |
+    /// | Scenario VUs / duration / ramp-up / think-time from config | yes | yes |
+    /// | `max_concurrent_requests` from `[http]` | yes | yes |
+    /// | Stage-level load profiles / stage `target_rps` | yes | yes |
+    /// | Top-level open-loop `ExecutionOptions::target_rps` | **no** (always `None`) | yes (`--target-rps`) |
+    /// | `abort_on_error` | **no** (always `false`) | yes |
+    /// | `isolate_clients_per_user` | **no** (always `false`) | yes |
+    ///
+    /// Embedders that need the CLI-parity knobs should call
+    /// [`Self::apply_config`], [`Self::add_scenario`] (or build scenarios from
+    /// the config), then [`Self::run_all`] with an explicit
+    /// [`ExecutionOptions`].
     pub async fn run(&self, config: &Config) -> Result<TestResults> {
         config.validate()?;
         // Build scenarios from the configuration

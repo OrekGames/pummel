@@ -3,11 +3,11 @@
 //! A high-throughput, multithreaded HTTP load testing library.
 //!
 //! This library allows users to define test scenarios in a declarative fashion,
-//! either in code or via TOML configuration. It builds a dependency graph which
-//! can be visualized and captures request metrics related to the performance of
-//! the load test. Metrics can be streamed to a pluggable [`telemetry`]
-//! exporter (a real newline-delimited JSON exporter ships in the box; embedders
-//! can implement their own).
+//! either in code or via TOML or YAML configuration. It builds a dependency
+//! graph which can be visualized and captures request metrics related to the
+//! performance of the load test. Metrics can be streamed to a pluggable
+//! [`telemetry`] exporter (a real newline-delimited JSON exporter ships in the
+//! box; embedders can implement their own).
 //!
 //! # Examples
 //!
@@ -59,8 +59,12 @@
 //!
 //! ## Running from a configuration file
 //!
-//! Mirrors the README "Using Configuration Files" snippet. `Config::from_toml`
-//! parses TOML instead.
+//! Mirrors the README "Using Configuration Files" snippet. Prefer
+//! [`Engine::apply_config`](crate::engine::Engine::apply_config) +
+//! [`run_all`](crate::engine::Engine::run_all) when you need CLI-parity knobs
+//! (`abort_on_error`, per-VU client isolation, top-level `target_rps`);
+//! [`Engine::run`](crate::engine::Engine::run) is the narrower convenience path.
+//! `Config::from_toml` parses TOML instead of YAML.
 //!
 //! ```no_run
 //! use pummel::prelude::*;

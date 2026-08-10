@@ -385,9 +385,21 @@ async fn main() -> Result<()> {
 
 ### Using Configuration Files
 
-`Engine` is the single entry point. `Engine::run` loads the `[http]`,
-`[metrics]`, and `[telemetry]` config sections and wires the client, collector,
-and exporter automatically.
+`Engine` is the single entry point. There are two config-driven paths:
+
+| Capability | `Engine::run(&Config)` | `apply_config` + `run_all` (CLI path) |
+|---|---|---|
+| Load `[http]` / `[metrics]` / `[telemetry]` | yes | yes |
+| Scenario VUs / duration / ramp-up / think-time from config | yes | yes |
+| `max_concurrent_requests` from `[http]` | yes | yes |
+| Stage-level load profiles / stage `target_rps` | yes | yes |
+| Top-level open-loop `target_rps` | **no** (hardcoded `None`) | yes |
+| `abort_on_error` | **no** (hardcoded `false`) | yes |
+| `isolate_clients_per_user` | **no** (hardcoded `false`) | yes |
+
+`Engine::run` is the convenience path: it loads factories from config and runs
+with those fixed defaults. Prefer `apply_config` + `run_all` when you need
+CLI-parity knobs.
 
 ```rust
 use pummel::prelude::*;
@@ -401,6 +413,38 @@ async fn main() -> Result<()> {
     let results = engine.run(&config).await?;
 
     println!("Test completed with {} requests", results.total_requests);
+    Ok(())
+}
+```
+
+### Advanced: CLI-parity embedder recipe
+
+```rust
+use pummel::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = Config::from_toml("config.toml")?;
+    let scenarios = config.build_scenarios()?;
+
+    let mut engine = Engine::new();
+    engine.apply_config(&config)?;
+    for scenario in scenarios {
+        engine.add_scenario(scenario);
+    }
+
+    let options = ExecutionOptions::builder()
+        .max_concurrent_requests(config.http.max_concurrent_requests)
+        .target_rps(Some(50.0))
+        .abort_on_error(true)
+        .isolate_clients_per_user(true)
+        .build();
+
+    let results = engine.run_all(options).await?;
+    println!(
+        "status={:?} requests={}",
+        results.status, results.total_requests
+    );
     Ok(())
 }
 ```
