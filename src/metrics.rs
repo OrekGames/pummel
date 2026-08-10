@@ -454,8 +454,16 @@ pub trait MetricsCollector: Send + Sync {
         Ok(())
     }
 
-    /// Get metrics for a step
-    async fn get_step_metrics(&self, step_id: &StepId) -> Result<Option<StepMetrics>>;
+    /// Get metrics for a step within a scenario.
+    ///
+    /// Step IDs are only unique within a scenario; callers must supply both
+    /// identifiers so a shared step id across scenarios cannot return the
+    /// wrong aggregate.
+    async fn get_step_metrics(
+        &self,
+        scenario_id: &ScenarioId,
+        step_id: &StepId,
+    ) -> Result<Option<StepMetrics>>;
 
     /// Get metrics for a scenario
     async fn get_scenario_metrics(
@@ -941,16 +949,15 @@ impl MetricsCollector for InMemoryMetricsCollector {
         Ok(())
     }
 
-    async fn get_step_metrics(&self, step_id: &StepId) -> Result<Option<StepMetrics>> {
-        // A step id can in principle be reused across scenarios; the trait only
-        // gives us the step id, so we resolve the first matching key (same
-        // limitation as the previous implementation).
-        for entry in self.steps.iter() {
-            if entry.key().1 == *step_id {
-                return Ok(Some(Self::build_step_metrics(step_id, entry.value())));
-            }
-        }
-        Ok(None)
+    async fn get_step_metrics(
+        &self,
+        scenario_id: &ScenarioId,
+        step_id: &StepId,
+    ) -> Result<Option<StepMetrics>> {
+        Ok(self
+            .steps
+            .get(&(scenario_id.clone(), step_id.clone()))
+            .map(|entry| Self::build_step_metrics(step_id, entry.value())))
     }
 
     async fn get_scenario_metrics(
@@ -1083,7 +1090,11 @@ impl MetricsCollector for NoopMetricsCollector {
         false
     }
 
-    async fn get_step_metrics(&self, _step_id: &StepId) -> Result<Option<StepMetrics>> {
+    async fn get_step_metrics(
+        &self,
+        _scenario_id: &ScenarioId,
+        _step_id: &StepId,
+    ) -> Result<Option<StepMetrics>> {
         Ok(None)
     }
 
@@ -1208,12 +1219,12 @@ mod tests {
         .unwrap();
 
         let full_step = full
-            .get_step_metrics(&"step1".to_string())
+            .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
             .await
             .unwrap()
             .unwrap();
         let slim_step = slim
-            .get_step_metrics(&"step1".to_string())
+            .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
             .await
             .unwrap()
             .unwrap();
@@ -1260,7 +1271,7 @@ mod tests {
 
         // Get step metrics
         let step_metrics = collector
-            .get_step_metrics(&"step1".to_string())
+            .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
             .await
             .unwrap()
             .unwrap();
@@ -1419,7 +1430,7 @@ mod tests {
             .unwrap();
 
         let step = collector
-            .get_step_metrics(&"step1".to_string())
+            .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
             .await
             .unwrap()
             .unwrap();
@@ -1465,7 +1476,7 @@ mod tests {
         collector.record_request(metrics).await.unwrap();
 
         let step = collector
-            .get_step_metrics(&"step1".to_string())
+            .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
             .await
             .unwrap()
             .unwrap();
@@ -1523,7 +1534,7 @@ mod tests {
             .unwrap();
 
         let step = collector
-            .get_step_metrics(&"step1".to_string())
+            .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
             .await
             .unwrap()
             .unwrap();
@@ -1570,5 +1581,143 @@ mod tests {
 
         assert_eq!(results.total_requests, 0);
         assert!(results.scenarios.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_step_metrics_is_scenario_scoped() {
+        // Same step id in two scenarios must resolve independently.
+        let collector = InMemoryMetricsCollector::new();
+        collector
+            .record_request(RequestMetrics::new(RequestMetricsParams {
+                id: "a".to_string(),
+                step_id: "shared".to_string(),
+                step_name: "Shared A".to_string(),
+                scenario_id: "scenario-a".to_string(),
+                scenario_name: "A".to_string(),
+                virtual_user_id: 0,
+                request: &Request::get("https://example.com/a").build().unwrap(),
+                response: Some(&Response::new(
+                    StatusCode::OK,
+                    reqwest::header::HeaderMap::new(),
+                    crate::http::Body::Empty,
+                    Duration::from_millis(10),
+                )),
+                error: None,
+                elapsed: Duration::from_millis(10),
+            }))
+            .await
+            .unwrap();
+        collector
+            .record_request(RequestMetrics::new(RequestMetricsParams {
+                id: "b".to_string(),
+                step_id: "shared".to_string(),
+                step_name: "Shared B".to_string(),
+                scenario_id: "scenario-b".to_string(),
+                scenario_name: "B".to_string(),
+                virtual_user_id: 0,
+                request: &Request::get("https://example.com/b").build().unwrap(),
+                response: Some(&Response::new(
+                    StatusCode::OK,
+                    reqwest::header::HeaderMap::new(),
+                    crate::http::Body::Empty,
+                    Duration::from_millis(20),
+                )),
+                error: None,
+                elapsed: Duration::from_millis(20),
+            }))
+            .await
+            .unwrap();
+        // A second hit under scenario-a so totals differ.
+        collector
+            .record_request(RequestMetrics::new(RequestMetricsParams {
+                id: "a2".to_string(),
+                step_id: "shared".to_string(),
+                step_name: "Shared A".to_string(),
+                scenario_id: "scenario-a".to_string(),
+                scenario_name: "A".to_string(),
+                virtual_user_id: 1,
+                request: &Request::get("https://example.com/a").build().unwrap(),
+                response: Some(&Response::new(
+                    StatusCode::OK,
+                    reqwest::header::HeaderMap::new(),
+                    crate::http::Body::Empty,
+                    Duration::from_millis(30),
+                )),
+                error: None,
+                elapsed: Duration::from_millis(30),
+            }))
+            .await
+            .unwrap();
+
+        let a = collector
+            .get_step_metrics(&"scenario-a".to_string(), &"shared".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let b = collector
+            .get_step_metrics(&"scenario-b".to_string(), &"shared".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(a.total_requests, 2);
+        assert_eq!(a.name, "Shared A");
+        assert_eq!(a.min_response_time_ms, 10);
+        assert_eq!(b.total_requests, 1);
+        assert_eq!(b.name, "Shared B");
+        assert_eq!(b.min_response_time_ms, 20);
+        assert!(
+            collector
+                .get_step_metrics(&"missing".to_string(), &"shared".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn request_metrics_redacts_url_userinfo() {
+        let request = Request::get("https://alice:s3cret@example.com/path?q=1")
+            .build()
+            .unwrap();
+        let response = Response::new(
+            StatusCode::OK,
+            reqwest::header::HeaderMap::new(),
+            crate::http::Body::Empty,
+            Duration::from_millis(5),
+        );
+        let metrics = RequestMetrics::new(RequestMetricsParams {
+            id: "creds".to_string(),
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 0,
+            request: &request,
+            response: Some(&response),
+            error: None,
+            elapsed: Duration::from_millis(5),
+        });
+
+        assert!(
+            !metrics.url.contains("alice"),
+            "username must be stripped from recorded URL: {}",
+            metrics.url
+        );
+        assert!(
+            !metrics.url.contains("s3cret"),
+            "password must be stripped from recorded URL: {}",
+            metrics.url
+        );
+        assert!(
+            metrics.url.contains("example.com/path"),
+            "host and path must remain: {}",
+            metrics.url
+        );
+        assert!(
+            metrics.url.contains("q=1"),
+            "query string must remain: {}",
+            metrics.url
+        );
     }
 }

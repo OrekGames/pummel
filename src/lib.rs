@@ -134,7 +134,9 @@ pub mod prelude {
     pub use crate::graph::{DependencyGraph, GraphFormat, GraphVisualizer};
     pub use crate::http::{HttpClient, Request, Response};
     pub use crate::logging;
-    pub use crate::metrics::{MetricsCollector, MetricsCollectorFactory, RunStatus, TestResults};
+    pub use crate::metrics::{
+        MetricsCollector, MetricsCollectorFactory, RequestMetrics, RunStatus, TestResults,
+    };
     pub use crate::scenario::{
         BranchCondition, BranchOperator, DynamicBodyTemplate, DynamicRequestSpec, Extractor,
         ExtractorSource, LoadProfile, LoadStage, Scenario, ScenarioBuilder, Step, StepBuilder,
@@ -155,5 +157,11 @@ mod tests {
         // VERSION should be a valid semver string like "0.1.0"
         assert!(VERSION.len() >= 5); // At least "0.0.0"
         assert!(VERSION.contains('.'));
+    }
+
+    #[test]
+    fn prelude_reexports_request_metrics() {
+        // Compile-time coverage that embedders can pull RequestMetrics from prelude.
+        fn _assert_prelude_export(_: prelude::RequestMetrics) {}
     }
 }

@@ -361,4 +361,31 @@ mod tests {
         assert_eq!(sanitize_mermaid_id("keep_this1"), "keep_this1");
         assert_eq!(escape_mermaid_label("a\"b\"c"), "a#quot;b#quot;c");
     }
+
+    #[test]
+    fn json_graph_redacts_url_userinfo() {
+        let request = Request::get("https://alice:s3cret@example.com/secure")
+            .build()
+            .unwrap();
+        let step = StepBuilder::new("auth", "Auth", request).build();
+        let scenario = ScenarioBuilder::new("scenario1", "Test Scenario")
+            .step(step)
+            .build()
+            .unwrap();
+        let graph = DependencyGraph::new(scenario).unwrap();
+        let json = graph.visualize(GraphFormat::Json).unwrap();
+
+        assert!(
+            !json.contains("alice"),
+            "username must not appear in graph JSON: {json}"
+        );
+        assert!(
+            !json.contains("s3cret"),
+            "password must not appear in graph JSON: {json}"
+        );
+        assert!(
+            json.contains("example.com/secure"),
+            "host and path must remain: {json}"
+        );
+    }
 }
