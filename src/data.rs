@@ -1,25 +1,16 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dashmap::DashMap;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-
-/// Parsed tokens for relative `{{data.<source>.<path>}}` lookups.
-///
-/// Template paths are static per scenario, so caching avoids `format!("$.…")`
-/// + re-parse on every render/extract.
-fn relative_path_token_cache() -> &'static DashMap<String, Arc<Vec<JsonPathToken>>> {
-    static CACHE: OnceLock<DashMap<String, Arc<Vec<JsonPathToken>>>> = OnceLock::new();
-    CACHE.get_or_init(DashMap::new)
-}
 
 /// External fixture source used by dynamic scenarios.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,13 +538,21 @@ pub fn extract_relative_json_path(value: &Value, path: &str) -> Option<Value> {
 }
 
 fn cached_relative_json_path_tokens(path: &str) -> Option<Arc<Vec<JsonPathToken>>> {
-    let cache = relative_path_token_cache();
-    if let Some(existing) = cache.get(path) {
-        return Some(Arc::clone(existing.value()));
+    thread_local! {
+        static CACHE: RefCell<lru::LruCache<String, Arc<Vec<JsonPathToken>>>> = RefCell::new(
+            lru::LruCache::new(NonZeroUsize::new(1000).unwrap())
+        );
     }
-    let tokens = Arc::new(parse_relative_json_path(path).ok()?);
-    cache.insert(path.to_string(), Arc::clone(&tokens));
-    Some(tokens)
+    CACHE.with(|cache| {
+        if let Some(existing) = cache.borrow_mut().get(path) {
+            return Some(Arc::clone(existing));
+        }
+        let tokens = Arc::new(parse_relative_json_path(path).ok()?);
+        cache
+            .borrow_mut()
+            .put(path.to_string(), Arc::clone(&tokens));
+        Some(tokens)
+    })
 }
 
 /// Parse `field…` / `field[i]…` as if it were `$.{path}` (no String alloc).
