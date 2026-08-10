@@ -171,6 +171,24 @@ impl BoundedTelemetryExporter {
     pub fn default_drop(inner: Arc<dyn TelemetryExporter>) -> Self {
         Self::new(inner, TelemetryBackpressure::Drop, 1024)
     }
+
+    /// Close the request queue and wait for the background worker to finish.
+    ///
+    /// Idempotent: a second call is a no-op once the sender/worker are gone.
+    /// Used by [`export_results`](TelemetryExporter::export_results) so the
+    /// aggregate line cannot race ahead of still-queued request telemetry, and
+    /// by [`shutdown`](TelemetryExporter::shutdown) so a post-export shutdown
+    /// remains safe.
+    async fn drain_request_queue(&self) {
+        // Dropping the sender ends the worker's `recv` loop after it finishes
+        // any items already in the channel.
+        self.sender.lock().await.take();
+        if let Some(handle) = self.worker.lock().await.take()
+            && let Err(err) = handle.await
+        {
+            error!("Telemetry worker failed: {err}");
+        }
+    }
 }
 
 #[async_trait]
@@ -218,16 +236,16 @@ impl TelemetryExporter for BoundedTelemetryExporter {
     }
 
     async fn export_results(&self, results: &TestResults) -> Result<()> {
+        // Drain queued request lines before writing the aggregate so NDJSON
+        // (and any ordered sink) never emits results ahead of in-flight requests.
+        self.drain_request_queue().await;
         self.inner.export_results(results).await
     }
 
     async fn shutdown(&self) -> Result<()> {
-        self.sender.lock().await.take();
-        if let Some(handle) = self.worker.lock().await.take()
-            && let Err(err) = handle.await
-        {
-            error!("Telemetry worker failed: {err}");
-        }
+        // Safe after `export_results`: drain is idempotent when the queue is
+        // already closed and the worker has joined.
+        self.drain_request_queue().await;
         self.inner.shutdown().await
     }
 }
@@ -448,6 +466,11 @@ impl TelemetryExporterFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::Request;
+    use crate::metrics::RequestMetricsParams;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     #[test]
     fn test_exporter_config_default() {
@@ -520,5 +543,254 @@ mod tests {
         let exporter = JsonTelemetryExporter::new();
         assert!(exporter.init().await.is_ok());
         assert!(exporter.shutdown().await.is_ok());
+    }
+
+    /// Mock exporter whose `export_request` waits on a gate so queue/backpressure
+    /// and drain ordering can be asserted deterministically.
+    struct GatedMockExporter {
+        gate_open: AtomicBool,
+        notify: Notify,
+        events: StdMutex<Vec<&'static str>>,
+        /// Increments as soon as the worker enters `export_request` (before gate).
+        entered: std::sync::atomic::AtomicUsize,
+        request_count: std::sync::atomic::AtomicUsize,
+        results_count: std::sync::atomic::AtomicUsize,
+        shutdown_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GatedMockExporter {
+        fn new(gate_open: bool) -> Arc<Self> {
+            Arc::new(Self {
+                gate_open: AtomicBool::new(gate_open),
+                notify: Notify::new(),
+                events: StdMutex::new(Vec::new()),
+                entered: std::sync::atomic::AtomicUsize::new(0),
+                request_count: std::sync::atomic::AtomicUsize::new(0),
+                results_count: std::sync::atomic::AtomicUsize::new(0),
+                shutdown_count: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn open_gate(&self) {
+            self.gate_open.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
+        }
+
+        async fn wait_entered(&self, n: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while self.entered.load(Ordering::SeqCst) < n {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "timed out waiting for worker to enter export_request ({}/{})",
+                        self.entered.load(Ordering::SeqCst),
+                        n
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TelemetryExporter for GatedMockExporter {
+        async fn init(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn export_request(&self, _metrics: &RequestMetrics) -> Result<()> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            while !self.gate_open.load(Ordering::SeqCst) {
+                self.notify.notified().await;
+            }
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+            self.events.lock().unwrap().push("request");
+            Ok(())
+        }
+
+        async fn export_results(&self, _results: &TestResults) -> Result<()> {
+            self.results_count.fetch_add(1, Ordering::SeqCst);
+            self.events.lock().unwrap().push("results");
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<()> {
+            self.shutdown_count.fetch_add(1, Ordering::SeqCst);
+            self.events.lock().unwrap().push("shutdown");
+            Ok(())
+        }
+    }
+
+    fn sample_metrics(id: &str) -> RequestMetrics {
+        let request = Request::get("https://example.com").build().unwrap();
+        RequestMetrics::new(RequestMetricsParams {
+            id: id.to_string(),
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            scenario_id: "scenario1".to_string(),
+            scenario_name: "Scenario 1".to_string(),
+            virtual_user_id: 0,
+            request: &request,
+            response: None,
+            error: None,
+            elapsed: Duration::from_millis(1),
+        })
+    }
+
+    #[tokio::test]
+    async fn export_results_drains_queued_requests_before_aggregate() {
+        let mock = GatedMockExporter::new(false);
+        let bounded = BoundedTelemetryExporter::new(mock.clone(), TelemetryBackpressure::Drop, 8);
+        bounded.init().await.unwrap();
+
+        for i in 0..3 {
+            bounded
+                .export_request(&sample_metrics(&format!("r{i}")))
+                .await
+                .unwrap();
+        }
+        mock.wait_entered(1).await;
+
+        // Release the worker, then export results: drain must finish every
+        // queued request before the aggregate callback runs.
+        mock.open_gate();
+        bounded.export_results(&TestResults::new()).await.unwrap();
+
+        let events = mock.events();
+        assert_eq!(
+            mock.request_count.load(Ordering::SeqCst),
+            3,
+            "all queued requests must export"
+        );
+        assert_eq!(mock.results_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            events,
+            vec!["request", "request", "request", "results"],
+            "aggregate must follow drained requests, got {events:?}"
+        );
+
+        // Shutdown after export_results must remain safe (idempotent drain).
+        bounded.shutdown().await.unwrap();
+        assert_eq!(mock.shutdown_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mock.events(),
+            vec!["request", "request", "request", "results", "shutdown"]
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_backpressure_discards_when_queue_full() {
+        let mock = GatedMockExporter::new(false);
+        let capacity = 2usize;
+        let bounded =
+            BoundedTelemetryExporter::new(mock.clone(), TelemetryBackpressure::Drop, capacity);
+        bounded.init().await.unwrap();
+
+        // First send is taken by the blocked worker; the next `capacity` fill
+        // the channel; one more must be dropped without error.
+        bounded
+            .export_request(&sample_metrics("held"))
+            .await
+            .unwrap();
+        mock.wait_entered(1).await;
+        for i in 0..capacity {
+            bounded
+                .export_request(&sample_metrics(&format!("q{i}")))
+                .await
+                .unwrap();
+        }
+        assert!(
+            bounded
+                .export_request(&sample_metrics("overflow"))
+                .await
+                .is_ok(),
+            "Drop mode must return Ok when the queue is full"
+        );
+        assert!(
+            bounded.warned_full.load(Ordering::Relaxed),
+            "queue-full Drop path should set the one-shot warned flag"
+        );
+
+        mock.open_gate();
+        bounded.export_results(&TestResults::new()).await.unwrap();
+        // held + capacity queued items; overflow dropped.
+        assert_eq!(
+            mock.request_count.load(Ordering::SeqCst),
+            1 + capacity,
+            "overflow request must be dropped"
+        );
+        bounded.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_backpressure_waits_for_capacity() {
+        let mock = GatedMockExporter::new(false);
+        let capacity = 1usize;
+        let bounded =
+            BoundedTelemetryExporter::new(mock.clone(), TelemetryBackpressure::Block, capacity);
+        bounded.init().await.unwrap();
+
+        bounded
+            .export_request(&sample_metrics("held"))
+            .await
+            .unwrap();
+        mock.wait_entered(1).await;
+        bounded
+            .export_request(&sample_metrics("queued"))
+            .await
+            .unwrap();
+
+        let blocked = Arc::new(AtomicBool::new(true));
+        let blocked_flag = blocked.clone();
+        let bounded = Arc::new(bounded);
+        let send_task = {
+            let bounded = bounded.clone();
+            tokio::spawn(async move {
+                bounded
+                    .export_request(&sample_metrics("blocked"))
+                    .await
+                    .unwrap();
+                blocked_flag.store(false, Ordering::SeqCst);
+            })
+        };
+
+        // While the queue is full and the worker is gated, the Block send must
+        // still be waiting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            blocked.load(Ordering::SeqCst),
+            "Block mode must wait when the queue is full"
+        );
+
+        mock.open_gate();
+        tokio::time::timeout(Duration::from_secs(2), send_task)
+            .await
+            .expect("blocked send should complete after drain capacity frees")
+            .unwrap();
+        assert!(!blocked.load(Ordering::SeqCst));
+
+        bounded.export_results(&TestResults::new()).await.unwrap();
+        assert_eq!(mock.request_count.load(Ordering::SeqCst), 3);
+        bounded.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_when_export_results_skipped() {
+        let mock = GatedMockExporter::new(true);
+        let bounded = BoundedTelemetryExporter::new(mock.clone(), TelemetryBackpressure::Drop, 4);
+        bounded.init().await.unwrap();
+        bounded
+            .export_request(&sample_metrics("solo"))
+            .await
+            .unwrap();
+        bounded.shutdown().await.unwrap();
+
+        assert_eq!(mock.request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.results_count.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.shutdown_count.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.events(), vec!["request", "shutdown"]);
     }
 }
