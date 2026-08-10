@@ -2,14 +2,14 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lru::LruCache;
 use rand::RngExt;
 use serde::de::IgnoredAny;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -43,7 +43,10 @@ type MetricsCollectorFactoryFn = Arc<dyn Fn() -> Arc<dyn MetricsCollector> + Sen
 #[doc(hidden)]
 pub struct RateLimiter {
     interval: Duration,
-    next_start: Mutex<Instant>,
+    // Using std::sync::Mutex instead of tokio::sync::Mutex on this hot path
+    // because the critical section only performs fast, synchronous math and is
+    // dropped before sleeping, avoiding async lock overhead.
+    next_start: std::sync::Mutex<Instant>,
 }
 
 impl RateLimiter {
@@ -55,7 +58,7 @@ impl RateLimiter {
         }
         Some(Arc::new(Self {
             interval: Duration::from_secs_f64(1.0 / rate_per_second),
-            next_start: Mutex::new(Instant::now()),
+            next_start: std::sync::Mutex::new(Instant::now()),
         }))
     }
 
@@ -69,7 +72,7 @@ impl RateLimiter {
     #[doc(hidden)]
     pub async fn acquire_before_deadline(&self, deadline: Option<Instant>) -> bool {
         let sleep_for = {
-            let mut next = self.next_start.lock().await;
+            let mut next = self.next_start.lock().unwrap();
             let now = Instant::now();
             if deadline.is_some_and(|deadline| now >= deadline) {
                 return false;
@@ -581,9 +584,11 @@ fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
     })
 }
 
-fn dynamic_regex_cache() -> &'static std::sync::Mutex<LruCache<String, Arc<regex::Regex>>> {
-    static CACHE: OnceLock<std::sync::Mutex<LruCache<String, Arc<regex::Regex>>>> = OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())))
+thread_local! {
+    // ⚡ Bolt Optimization: Use a thread-local cache to eliminate lock contention on the hot path
+    // when dynamically compiling or matching regexes in extractors across many virtual users.
+    static EXTRACTOR_REGEX_CACHE: std::cell::RefCell<LruCache<String, Arc<regex::Regex>>> =
+        std::cell::RefCell::new(LruCache::new(NonZeroUsize::new(1024).unwrap()));
 }
 
 fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<String>> {
@@ -591,28 +596,23 @@ fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<S
         return Ok(regex_capture(regex, haystack));
     }
 
-    let cache = dynamic_regex_cache();
-
-    // Fast path: Try reading from LRU and clone the Arc so we don't hold the lock during capture.
-    let cached_re = {
-        let mut cache_lock = cache.lock().unwrap();
-        cache_lock.get(&extractor.selector).cloned()
-    };
+    let cached_re =
+        EXTRACTOR_REGEX_CACHE.with(|cache| cache.borrow_mut().get(&extractor.selector).cloned());
 
     if let Some(re) = cached_re {
         return Ok(regex_capture(&re, haystack));
     }
 
-    // Slow path: Compile outside the lock, then insert
     let re = Arc::new(
         regex::Regex::new(&extractor.selector)
             .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?,
     );
 
-    {
-        let mut cache_lock = cache.lock().unwrap();
-        cache_lock.put(extractor.selector.clone(), re.clone());
-    }
+    EXTRACTOR_REGEX_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .put(extractor.selector.clone(), re.clone());
+    });
 
     Ok(regex_capture(&re, haystack))
 }
@@ -753,7 +753,9 @@ struct VirtualUserContext {
     rate_limiter: Option<Arc<RateLimiter>>,
 
     /// Per-VU dynamic scenario state.
-    vu_context: Arc<Mutex<VuContext>>,
+    // Using std::sync::Mutex rather than tokio::sync::Mutex to eliminate async
+    // lock overhead since all updates are fast, synchronous hashmap operations.
+    vu_context: Arc<std::sync::Mutex<VuContext>>,
 
     /// Loaded data sources shared by all VUs for this scenario run.
     data_sources: Arc<LoadedDataSources>,
@@ -793,7 +795,10 @@ impl VirtualUserContext {
             options: shared_state.options,
             semaphore: shared_state.semaphore,
             rate_limiter: shared_state.rate_limiter,
-            vu_context: Arc::new(Mutex::new(VuContext::new(id, scenario.id.clone()))),
+            vu_context: Arc::new(std::sync::Mutex::new(VuContext::new(
+                id,
+                scenario.id.clone(),
+            ))),
             data_sources: shared_state.data_sources,
             end_time: None,
             status: VirtualUserStatus::Waiting,
@@ -937,7 +942,7 @@ impl VirtualUserContext {
         vu_id: u32,
         semaphore: Option<Arc<Semaphore>>,
         rate_limiter: Option<Arc<RateLimiter>>,
-        vu_context: Arc<Mutex<VuContext>>,
+        vu_context: Arc<std::sync::Mutex<VuContext>>,
         deadline: Option<Instant>,
     ) -> StepOutcome {
         // Re-borrow the step from the shared scenario. A missing step is a
@@ -962,7 +967,7 @@ impl VirtualUserContext {
         }
 
         if let Some(branch) = &step.branch {
-            let ctx = vu_context.lock().await;
+            let ctx = vu_context.lock().unwrap();
             if !branch_matches(&ctx, &step.id, branch) {
                 return StepOutcome {
                     step_id,
@@ -1042,7 +1047,7 @@ impl VirtualUserContext {
             }
 
             let request = if let Some(spec) = &step.dynamic_request {
-                let ctx = vu_context.lock().await;
+                let ctx = vu_context.lock().unwrap();
                 match render_request(step, spec, &ctx) {
                     Ok(request) => request,
                     Err(err) => {
@@ -1139,7 +1144,7 @@ impl VirtualUserContext {
                             }
                         }
                         if error.is_none() && !extracted.is_empty() {
-                            let mut ctx = vu_context.lock().await;
+                            let mut ctx = vu_context.lock().unwrap();
                             for (name, value) in extracted {
                                 ctx.insert_var(name, value);
                             }
@@ -1437,7 +1442,7 @@ impl VirtualUserContext {
             self.reset_statuses();
             let data_rows = self.data_sources.bind_iteration(self.id, iteration)?;
             {
-                let mut ctx = self.vu_context.lock().await;
+                let mut ctx = self.vu_context.lock().unwrap();
                 ctx.iteration = iteration;
                 ctx.set_data_rows(data_rows);
             }
