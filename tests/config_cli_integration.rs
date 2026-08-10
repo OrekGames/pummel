@@ -640,6 +640,147 @@ fn proof7_dry_run_does_not_run_load() {
     );
 }
 
+/// Binary contract: a run that ends `Truncated` still prints parseable results
+/// on stdout and exits 1 (not the threshold-breach code 2).
+#[test]
+fn proof7_truncated_run_exits_one_with_parseable_results() {
+    // Slow replies + a long dependent chain under a 1s duration force the
+    // in-pass deadline check to fire mid-scenario (RunStatus::Truncated).
+    let server = TestServer::start(|_m, _p| {
+        thread::sleep(Duration::from_millis(200));
+        Reply::ok("ok")
+    });
+
+    let mut steps = String::from(
+        r#"
+[global]
+base_url = "{base}"
+virtual_users = 1
+duration_seconds = 1
+think_time_ms = 0
+timeout_ms = 5000
+
+[scenarios.s]
+name = "S"
+steps = ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"]
+
+"#,
+    );
+    for i in 0..10 {
+        steps.push_str(&format!(
+            r#"
+[steps.s{i}]
+name = "S{i}"
+method = "GET"
+url = "/{i}"
+"#
+        ));
+        if i > 0 {
+            steps.push_str(&format!("dependencies = [\"s{}\"]\n", i - 1));
+        }
+    }
+    let cfg = write_config(&steps.replace("{base}", &server.base()));
+
+    let out = Command::new(cli_bin())
+        .arg("--config")
+        .arg(cfg.path())
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "truncated runs must exit 1; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run truncated:"),
+        "stderr should announce truncation: {stderr}"
+    );
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON ({e}): {stdout:?}"));
+    assert_eq!(value["status"]["kind"], "truncated");
+    assert!(
+        value["total_requests"].as_u64().unwrap() >= 1,
+        "truncated runs still emit partial results: {value}"
+    );
+}
+
+/// Binary contract: a run that ends `Failed` still prints parseable results
+/// on stdout and exits 1.
+#[test]
+fn proof7_failed_run_exits_one_with_parseable_results() {
+    // One fixture row + sequential/fail + sustained duration: the second
+    // iteration exhausts the data source and surfaces RunStatus::Failed.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("users.csv"), "username\nalice\n").unwrap();
+    let server = TestServer::start(|_m, _p| Reply::ok("ok"));
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[global]
+base_url = "{base}"
+virtual_users = 1
+duration_seconds = 1
+think_time_ms = 0
+
+[data_sources.users]
+type = "csv"
+path = "users.csv"
+access = "sequential"
+exhaustion = "fail"
+
+[scenarios.s]
+name = "S"
+steps = ["a"]
+
+[steps.a]
+name = "A"
+method = "GET"
+url = "/{{{{data.users.username}}}}"
+"#,
+            base = server.base()
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(cli_bin())
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "failed runs must exit 1; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run failed:"),
+        "stderr should announce failure: {stderr}"
+    );
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON ({e}): {stdout:?}"));
+    assert_eq!(value["status"]["kind"], "failed");
+    assert!(
+        value["total_requests"].as_u64().unwrap() >= 1,
+        "failed runs still emit partial results from earlier iterations: {value}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Graph visualizer hook — with_graph_visualizer uses the custom visualizer
 // ---------------------------------------------------------------------------
