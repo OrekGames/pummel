@@ -14,7 +14,8 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use pummel::http::{Body, HttpStatus, Request, Response};
 use pummel::metrics::{
-    InMemoryMetricsCollector, MetricsCollector, MetricsCollectorFactory, RequestMetrics,
+    AttemptSummary, InMemoryMetricsCollector, MetricsCollector, MetricsCollectorFactory,
+    RequestMetrics,
 };
 use serde_json::json;
 use tokio::runtime::Runtime;
@@ -415,6 +416,111 @@ fn bench_request_metrics_construct(c: &mut Criterion) {
     group.finish();
 }
 
+/// Pre-seed one `(scenario, step)` aggregate, then measure occupied-entry
+/// `AttemptSummary` recording under single-thread and concurrent writers.
+///
+/// This isolates DashMap same-key contention on the production slim path
+/// without recreating the collector each iteration.
+fn bench_attempt_summary_same_key(c: &mut Criterion) {
+    let mut group = c.benchmark_group("attempt_summary_same_key");
+    group.throughput(Throughput::Elements(1));
+    group.sample_size(40);
+    group.measurement_time(Duration::from_secs(3));
+    group.warm_up_time(Duration::from_secs(1));
+
+    let rt = Runtime::new().unwrap();
+    let elapsed = Duration::from_millis(12);
+
+    // Warm the map once so timed iterations hit occupied entries.
+    let single = Arc::new(InMemoryMetricsCollector::new());
+    rt.block_on(async {
+        single
+            .record_attempt_summary(AttemptSummary {
+                scenario_id: "scenario_main",
+                step_id: "step_get",
+                step_name: "Get Items",
+                scenario_name: "Main Scenario",
+                virtual_user_id: 0,
+                success: true,
+                elapsed,
+            })
+            .await
+            .expect("seed");
+    });
+
+    group.bench_function("single_writer", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                single
+                    .record_attempt_summary(AttemptSummary {
+                        scenario_id: "scenario_main",
+                        step_id: "step_get",
+                        step_name: "Get Items",
+                        scenario_name: "Main Scenario",
+                        virtual_user_id: black_box(1),
+                        success: true,
+                        elapsed,
+                    })
+                    .await
+                    .expect("record");
+            })
+        });
+    });
+
+    for &writers in &[2usize, 8, 32] {
+        let shared = Arc::new(InMemoryMetricsCollector::new());
+        rt.block_on(async {
+            shared
+                .record_attempt_summary(AttemptSummary {
+                    scenario_id: "scenario_main",
+                    step_id: "step_get",
+                    step_name: "Get Items",
+                    scenario_name: "Main Scenario",
+                    virtual_user_id: 0,
+                    success: true,
+                    elapsed,
+                })
+                .await
+                .expect("seed");
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("concurrent_writers", writers),
+            &writers,
+            |b, &writers| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let handles: Vec<_> = (0..writers)
+                            .map(|writer| {
+                                let collector = Arc::clone(&shared);
+                                tokio::spawn(async move {
+                                    collector
+                                        .record_attempt_summary(AttemptSummary {
+                                            scenario_id: "scenario_main",
+                                            step_id: "step_get",
+                                            step_name: "Get Items",
+                                            scenario_name: "Main Scenario",
+                                            virtual_user_id: writer as u32,
+                                            success: true,
+                                            elapsed,
+                                        })
+                                        .await
+                                        .expect("record");
+                                })
+                            })
+                            .collect();
+                        for handle in handles {
+                            handle.await.expect("join");
+                        }
+                    })
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_threaded_recording,
@@ -423,5 +529,6 @@ criterion_group!(
     bench_metrics_retrieval,
     bench_factory_methods,
     bench_request_metrics_construct,
+    bench_attempt_summary_same_key,
 );
 criterion_main!(benches);

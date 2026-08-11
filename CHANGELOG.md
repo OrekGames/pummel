@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_concurrent_requests` to cap in-flight requests.
 - Docs: align `target_rps` wording with aggregate request-attempt pacing
   semantics (retries consume permits; no pacing behavior change).
+- Benchmarks: relabel historical vs production Criterion arms and add focused
+  baselines for same-key `AttemptSummary` recording and telemetry-on full
+  metrics construction (measurement only; no hot-path optimizations).
 
 ## [0.1.0] - 2026-07-06
 

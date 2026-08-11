@@ -657,11 +657,9 @@ impl HttpClient for DefaultHttpClient {
         let status = resp.status();
         let headers = resp.headers().clone();
 
-        // Read the response body. We keep the raw bytes rather than
-        // speculatively deserializing every payload as JSON: parsing on the
-        // hot path is the largest per-request CPU cost and is lossy (text
-        // like "123"/"null" would be coerced into a JSON body). Callers parse
-        // on demand via Response::json()/text().
+        // Keep the raw response bytes. Speculative JSON deserialization would
+        // be lossy for text like "123"/"null" and move parse cost onto every
+        // send; callers parse on demand via Response::json()/text().
         let body = if status == StatusCode::NO_CONTENT {
             Body::Empty
         } else {
