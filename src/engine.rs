@@ -9,7 +9,7 @@ use bytes::Bytes;
 use lru::LruCache;
 use rand::RngExt;
 use serde::de::IgnoredAny;
-use tokio::sync::Semaphore;
+use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -113,6 +113,25 @@ async fn sleep_before_deadline(delay: Duration, deadline: Option<Instant>) -> bo
     }
     sleep(delay).await;
     !deadline_expired(Some(deadline))
+}
+
+async fn acquire_semaphore_before_deadline(
+    semaphore: &Semaphore,
+    deadline: Option<Instant>,
+) -> std::result::Result<Option<SemaphorePermit<'_>>, AcquireError> {
+    let Some(deadline) = deadline else {
+        return semaphore.acquire().await.map(Some);
+    };
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+
+    match tokio::time::timeout(remaining, semaphore.acquire()).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Options for executing a scenario.
@@ -1125,8 +1144,20 @@ impl VirtualUserContext {
                     break;
                 }
                 let _permit = match &semaphore {
-                    Some(sem) => match sem.acquire().await {
-                        Ok(permit) => Some(permit),
+                    Some(sem) => match acquire_semaphore_before_deadline(sem, deadline).await {
+                        Ok(Some(permit)) => {
+                            // A permit becoming available at the boundary must
+                            // not allow a request to start after the run ended.
+                            if deadline_expired(deadline) {
+                                truncated = true;
+                                break;
+                            }
+                            Some(permit)
+                        }
+                        Ok(None) => {
+                            truncated = true;
+                            break;
+                        }
                         Err(err) => {
                             last_error = Some(Error::engine(format!(
                                 "Failed to acquire semaphore permit: {}",
