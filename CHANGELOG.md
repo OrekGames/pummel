@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pool_max_idle_per_host`. The setting has always controlled reqwest's idle
   connection-pool capacity, not simultaneous live connections; use
   `max_concurrent_requests` to cap in-flight requests.
+- Docs: align `target_rps` wording with aggregate request-attempt pacing
+  semantics (retries consume permits; no pacing behavior change).
 
 ## [0.1.0] - 2026-07-06
 

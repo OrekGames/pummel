@@ -73,8 +73,8 @@ struct Cli {
     #[arg(long)]
     ramp_up: Option<u64>,
 
-    /// Open-loop target arrival rate in requests/second (applies to every
-    /// scenario). Omit for closed-loop pacing driven by think time.
+    /// Aggregate request-attempt starts per second across active scenarios.
+    /// Retries consume permits. Omit for think-time pacing between passes.
     #[arg(long)]
     target_rps: Option<f64>,
 
