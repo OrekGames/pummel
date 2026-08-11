@@ -547,12 +547,12 @@ impl Default for GlobalConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
-    /// Maximum number of connections per host
-    #[serde(default = "default_max_connections_per_host")]
-    pub max_connections_per_host: usize,
+    /// Maximum idle connections retained per host in the connection pool.
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub pool_max_idle_per_host: usize,
 
     /// Maximum number of simultaneously in-flight requests across all virtual
-    /// users of a scenario. Decoupled from `max_connections_per_host` (a
+    /// users of a scenario. Decoupled from `pool_max_idle_per_host` (a
     /// connection-pool knob): this bounds concurrent requests via a per-send
     /// permit. `0` (the default) means unlimited, so the virtual-user count is
     /// the sole concurrency bound.
@@ -579,7 +579,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            max_connections_per_host: default_max_connections_per_host(),
+            pool_max_idle_per_host: default_pool_max_idle_per_host(),
             max_concurrent_requests: default_max_concurrent_requests(),
             connection_timeout_ms: default_connection_timeout_ms(),
             pool_idle_timeout_seconds: default_pool_idle_timeout_seconds(),
@@ -1651,7 +1651,7 @@ fn default_duration_seconds() -> u64 {
     60
 }
 
-fn default_max_connections_per_host() -> usize {
+fn default_pool_max_idle_per_host() -> usize {
     100
 }
 
@@ -2025,6 +2025,27 @@ mod tests {
     }
 
     #[test]
+    fn test_http_pool_max_idle_per_host_toml_key() {
+        let config = Config::from_toml_str(
+            r#"
+            [http]
+            pool_max_idle_per_host = 7
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.http.pool_max_idle_per_host, 7);
+
+        let old_key = r#"
+            [http]
+            max_connections_per_host = 7
+        "#;
+        assert!(
+            Config::from_toml_str(old_key).is_err(),
+            "the misleading pre-rename key must be rejected"
+        );
+    }
+
+    #[test]
     fn test_zero_virtual_users_is_rejected() {
         // virtual_users = 0 must fail loudly instead of running a zero-request
         // no-op that reports success (zero virtual_users fails loudly).
@@ -2208,6 +2229,27 @@ global:
   virtual_uzers: 10
 "#;
         assert!(Config::from_yaml_str(yaml_str).is_err());
+    }
+
+    #[test]
+    fn test_http_pool_max_idle_per_host_yaml_key() {
+        let config = Config::from_yaml_str(
+            r#"
+http:
+  pool_max_idle_per_host: 7
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.http.pool_max_idle_per_host, 7);
+
+        let old_key = r#"
+http:
+  max_connections_per_host: 7
+"#;
+        assert!(
+            Config::from_yaml_str(old_key).is_err(),
+            "the misleading pre-rename key must be rejected"
+        );
     }
 
     #[test]

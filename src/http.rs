@@ -532,7 +532,7 @@ impl ClientSpec {
         Ok(Self {
             connect_timeout: Duration::from_millis(http.connection_timeout_ms),
             pool_idle_timeout: Duration::from_secs(http.pool_idle_timeout_seconds),
-            pool_max_idle_per_host: http.max_connections_per_host,
+            pool_max_idle_per_host: http.pool_max_idle_per_host,
             use_http2: http.use_http2,
             verify_ssl: http.verify_ssl,
             default_headers,
@@ -776,7 +776,7 @@ mod tests {
         let http = HttpConfig {
             connection_timeout_ms: 1500,
             pool_idle_timeout_seconds: 45,
-            max_connections_per_host: 7,
+            pool_max_idle_per_host: 7,
             use_http2: true,
             verify_ssl: false,
             ..HttpConfig::default()
