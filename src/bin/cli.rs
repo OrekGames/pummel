@@ -90,7 +90,21 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let code = if err.use_stderr() {
+                exit::ERROR
+            } else {
+                exit::OK
+            };
+            if let Err(print_err) = err.print() {
+                eprintln!("error: {print_err}");
+                return ExitCode::from(exit::ERROR);
+            }
+            return ExitCode::from(code);
+        }
+    };
 
     // Set up logging based on verbosity. Logs go to stderr, so stdout carries
     // only results output (see `print_json_results`).
