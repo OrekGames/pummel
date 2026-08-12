@@ -72,7 +72,7 @@ impl RateLimiter {
     #[doc(hidden)]
     pub async fn acquire_before_deadline(&self, deadline: Option<Instant>) -> bool {
         let sleep_for = {
-            let mut next = self.next_start.lock().unwrap();
+            let mut next = self.next_start.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
             if deadline.is_some_and(|deadline| now >= deadline) {
                 return false;
@@ -991,7 +991,7 @@ impl VirtualUserContext {
         }
 
         if let Some(branch) = &step.branch {
-            let ctx = vu_context.lock().unwrap();
+            let ctx = vu_context.lock().unwrap_or_else(|e| e.into_inner());
             match branch_matches(&ctx, &step.id, branch) {
                 Ok(false) => {
                     return StepOutcome {
@@ -1083,7 +1083,7 @@ impl VirtualUserContext {
             }
 
             let request = if let Some(spec) = &step.dynamic_request {
-                let ctx = vu_context.lock().unwrap();
+                let ctx = vu_context.lock().unwrap_or_else(|e| e.into_inner());
                 match render_request(step, spec, &ctx) {
                     Ok(request) => request,
                     Err(err) => {
@@ -1180,7 +1180,7 @@ impl VirtualUserContext {
                             }
                         }
                         if error.is_none() && !extracted.is_empty() {
-                            let mut ctx = vu_context.lock().unwrap();
+                            let mut ctx = vu_context.lock().unwrap_or_else(|e| e.into_inner());
                             for (name, value) in extracted {
                                 ctx.insert_var(name, value);
                             }
@@ -1478,7 +1478,7 @@ impl VirtualUserContext {
             self.reset_statuses();
             let data_rows = self.data_sources.bind_iteration(self.id, iteration)?;
             {
-                let mut ctx = self.vu_context.lock().unwrap();
+                let mut ctx = self.vu_context.lock().unwrap_or_else(|e| e.into_inner());
                 ctx.iteration = iteration;
                 ctx.set_data_rows(data_rows);
             }
