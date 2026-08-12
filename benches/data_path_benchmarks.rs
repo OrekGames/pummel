@@ -1,5 +1,5 @@
-//! Microbenchmarks for data-path hot costs:
-//! - JSON-path parse-per-extract vs cached tokens
+//! Microbenchmarks for data-path hot costs (permanent regression guards):
+//! - JSON-path parse-per-extract vs cached tokens (production caches tokens)
 //! - relative `{{data.*}}` path: format+parse each access vs cached tokens
 //! - deep `Value` clone vs `Arc::clone` for fixture row bind
 //!

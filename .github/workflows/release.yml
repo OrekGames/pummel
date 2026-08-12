@@ -54,12 +54,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.MSRV }}
       - name: Cache Cargo
@@ -130,7 +130,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-unknown-linux-gnu
@@ -162,7 +162,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-apple-darwin
@@ -192,7 +192,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: aarch64-apple-darwin
@@ -222,7 +222,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
@@ -263,7 +263,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Authenticate to crates.io via Trusted Publishing
