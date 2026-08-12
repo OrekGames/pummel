@@ -362,8 +362,8 @@ async fn proof4_response_time_includes_body_ttfb_populated() {
         .expect("ttfb_ms must be populated, not hardcoded None");
     let total = resp.response_time();
 
-    // Body transfer was delayed 400ms AFTER headers. Bug: response_time was
-    // captured right after headers (TTFB-only) and excluded the body wait.
+    // Body transfer was delayed 400ms AFTER headers. This test ensures
+    // response_time includes the body wait, and is not captured right after headers (TTFB-only).
     assert!(
         total >= Duration::from_millis(300),
         "response_time must include the ~400ms body transfer, got {total:?}"
