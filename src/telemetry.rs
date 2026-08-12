@@ -577,7 +577,10 @@ mod tests {
         }
 
         fn events(&self) -> Vec<&'static str> {
-            self.events.lock().unwrap().clone()
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         async fn wait_entered(&self, n: usize) {
@@ -607,19 +610,28 @@ mod tests {
                 self.notify.notified().await;
             }
             self.request_count.fetch_add(1, Ordering::SeqCst);
-            self.events.lock().unwrap().push("request");
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("request");
             Ok(())
         }
 
         async fn export_results(&self, _results: &TestResults) -> Result<()> {
             self.results_count.fetch_add(1, Ordering::SeqCst);
-            self.events.lock().unwrap().push("results");
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("results");
             Ok(())
         }
 
         async fn shutdown(&self) -> Result<()> {
             self.shutdown_count.fetch_add(1, Ordering::SeqCst);
-            self.events.lock().unwrap().push("shutdown");
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("shutdown");
             Ok(())
         }
     }
