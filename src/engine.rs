@@ -415,33 +415,43 @@ fn branch_matches(
     ctx: &VuContext,
     step_id: &str,
     branch: &crate::scenario::BranchCondition,
-) -> bool {
+) -> Result<bool> {
     let value = resolve_branch_value(ctx, step_id, &branch.variable);
     match branch.operator {
-        BranchOperator::Exists => value.is_some(),
-        BranchOperator::Equals => match (value, &branch.value) {
+        BranchOperator::Exists => Ok(value.is_some()),
+        BranchOperator::Equals => Ok(match (value, &branch.value) {
             (Some(value), Some(expected)) => value_to_template_string(&value) == *expected,
             _ => false,
-        },
-        BranchOperator::NotEquals => match (value, &branch.value) {
+        }),
+        BranchOperator::NotEquals => Ok(match (value, &branch.value) {
             (Some(value), Some(expected)) => value_to_template_string(&value) != *expected,
             _ => false,
-        },
+        }),
         BranchOperator::GreaterThan => {
-            numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a > b)
+            Ok(numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| {
+                a > b
+            }))
         }
         BranchOperator::GreaterThanOrEqual => {
-            numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a >= b)
+            Ok(numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| {
+                a >= b
+            }))
         }
-        BranchOperator::LessThan => numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a < b),
+        BranchOperator::LessThan => {
+            Ok(numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| {
+                a < b
+            }))
+        }
         BranchOperator::LessThanOrEqual => {
-            numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| a <= b)
+            Ok(numeric_branch_cmp(value.as_ref(), &branch.value, |a, b| {
+                a <= b
+            }))
         }
         BranchOperator::MatchesRegex => match value {
             Some(value) => {
                 let haystack = value_to_template_string(&value);
                 if let Some(regex) = branch.compiled_regex.as_ref() {
-                    regex.is_match(&haystack)
+                    Ok(regex.is_match(&haystack))
                 } else if let Some(pattern) = &branch.value {
                     thread_local! {
                         static REGEX_CACHE: RefCell<LruCache<String, regex::Regex>> = RefCell::new(
@@ -452,22 +462,28 @@ fn branch_matches(
                     REGEX_CACHE.with(|cache| {
                         let mut cache = cache.borrow_mut();
                         if let Some(regex) = cache.get(pattern) {
-                            return regex.is_match(&haystack);
+                            return Ok(regex.is_match(&haystack));
                         }
 
-                        if let Ok(regex) = regex::Regex::new(pattern) {
-                            let is_match = regex.is_match(&haystack);
-                            cache.put(pattern.clone(), regex);
-                            is_match
-                        } else {
-                            false
+                        match regex::Regex::new(pattern) {
+                            Ok(regex) => {
+                                let is_match = regex.is_match(&haystack);
+                                cache.put(pattern.clone(), regex);
+                                Ok(is_match)
+                            }
+                            // Fail closed: invalid regex must not silently skip.
+                            Err(e) => Err(Error::validation(format!(
+                                "invalid branch regex '{pattern}': {e}"
+                            ))),
                         }
                     })
                 } else {
-                    false
+                    Err(Error::validation(
+                        "MatchesRegex branch requires a pattern".to_string(),
+                    ))
                 }
             }
-            None => false,
+            None => Ok(false),
         },
     }
 }
@@ -563,6 +579,10 @@ fn render_request(
                 if !has_content_type {
                     builder = builder.header("Content-Type", "application/json");
                 }
+            }
+            DynamicBodyTemplate::Binary(bytes) => {
+                // Opaque bytes: no template rendering; preserve exact payload.
+                builder = builder.binary(bytes.clone());
             }
         }
     }
@@ -819,10 +839,14 @@ impl VirtualUserContext {
             *status = StepStatus::Waiting;
         }
         self.ready_buf.clear();
-        for step_id in &self.scenario.root_step_ids {
-            if let Some(status) = self.step_statuses.get_mut(step_id) {
+        // Prefer the same root resolution as VU startup (`get_root_steps`),
+        // including its cache-miss fallback when `root_step_ids` is stale/empty
+        // after an embedder mutated `Scenario.steps` without rebuilding caches.
+        for step in self.scenario.get_root_steps() {
+            let step_id = step.id.clone();
+            if let Some(status) = self.step_statuses.get_mut(&step_id) {
                 *status = StepStatus::Ready;
-                self.ready_buf.push(step_id.clone());
+                self.ready_buf.push(step_id);
             }
         }
     }
@@ -970,14 +994,26 @@ impl VirtualUserContext {
 
         if let Some(branch) = &step.branch {
             let ctx = vu_context.lock().unwrap();
-            if !branch_matches(&ctx, &step.id, branch) {
-                return StepOutcome {
-                    step_id,
-                    success: true,
-                    skipped: true,
-                    truncated: false,
-                    error: None,
-                };
+            match branch_matches(&ctx, &step.id, branch) {
+                Ok(false) => {
+                    return StepOutcome {
+                        step_id,
+                        success: true,
+                        skipped: true,
+                        truncated: false,
+                        error: None,
+                    };
+                }
+                Ok(true) => {}
+                Err(err) => {
+                    return StepOutcome {
+                        step_id,
+                        success: false,
+                        skipped: false,
+                        truncated: false,
+                        error: Some(err),
+                    };
+                }
             }
         }
 
@@ -1483,8 +1519,9 @@ impl VirtualUserContext {
             }
 
             // (5) Pace before the next iteration, never sleeping past the
-            //     deadline.
-            if self.options.think_time.as_millis() > 0 {
+            //     deadline. Think time is closed-loop only; open-loop pacing is
+            //     owned by `target_rps` / the rate limiter.
+            if self.options.target_rps.is_none() && self.options.think_time.as_millis() > 0 {
                 // Closed-loop: think between sessions, but not past the deadline.
                 if now + self.options.think_time >= deadline {
                     break;
@@ -1865,7 +1902,25 @@ impl Engine {
         Ok(combined)
     }
 
-    /// Run all scenarios with the given configuration
+    /// Convenience entry point: validate/build scenarios from `config`, wire
+    /// factories via [`Self::apply_config`], then [`Self::run_all`].
+    ///
+    /// # Capability matrix vs CLI / `apply_config` + `run_all`
+    ///
+    /// | Capability | `Engine::run(&Config)` | CLI / `apply_config` + `run_all` |
+    /// |---|---|---|
+    /// | Load `[http]` / `[metrics]` / `[telemetry]` via `apply_config` | yes | yes |
+    /// | Scenario VUs / duration / ramp-up / think-time from config | yes | yes |
+    /// | `max_concurrent_requests` from `[http]` | yes | yes |
+    /// | Stage-level load profiles / stage `target_rps` | yes | yes |
+    /// | Top-level open-loop `ExecutionOptions::target_rps` | **no** (always `None`) | yes (`--target-rps`) |
+    /// | `abort_on_error` | **no** (always `false`) | yes |
+    /// | `isolate_clients_per_user` | **no** (always `false`) | yes |
+    ///
+    /// Embedders that need the CLI-parity knobs should call
+    /// [`Self::apply_config`], [`Self::add_scenario`] (or build scenarios from
+    /// the config), then [`Self::run_all`] with an explicit
+    /// [`ExecutionOptions`].
     pub async fn run(&self, config: &Config) -> Result<TestResults> {
         config.validate()?;
         // Build scenarios from the configuration
@@ -1906,13 +1961,18 @@ impl Engine {
             return Err(Error::config("target_rps must be finite and positive"));
         }
 
-        // Validate every scenario before running so that an invalid, cyclic, or
-        // self-dependent graph (constructable by embedders that bypass
-        // ScenarioBuilder) fails loudly instead of hanging VUs until timeout.
+        // Clone + rebuild scheduling caches at the run boundary so embedders that
+        // mutate `Scenario.steps` after `add_scenario` (bypassing `add_step` /
+        // builder finalize) cannot leave empty/stale `root_step_ids` and spin
+        // silent zero-work VU iterations. Validation runs on the rebuilt clone.
+        let mut prepared_scenarios = Vec::with_capacity(self.scenarios.len());
         for scenario in self.scenarios.values() {
+            let mut scenario = (**scenario).clone();
+            scenario.rebuild_scheduling_cache();
             scenario.validate().map_err(|e| {
                 Error::scenario(format!("Scenario '{}' is invalid: {e}", scenario.id))
             })?;
+            prepared_scenarios.push(Arc::new(scenario));
         }
 
         // Telemetry lifecycle: if an exporter is attached, initialize
@@ -1932,10 +1992,10 @@ impl Engine {
 
         // Create a vector to hold the futures for all scenario executions
         let mut scenario_futures = Vec::new();
-        let scenario_count = self.scenarios.len().max(1);
+        let scenario_count = prepared_scenarios.len().max(1);
 
         // Prepare futures for each scenario
-        for scenario in self.scenarios.values() {
+        for scenario in prepared_scenarios {
             // Create options for this scenario
             let split_target_rps = options
                 .target_rps
@@ -1951,16 +2011,11 @@ impl Engine {
 
             // Create a future for running this scenario
             let engine_ref = self.clone();
-            let scenario_clone = scenario.clone();
             let metrics_collector_clone = metrics_collector.clone();
 
             let future = tokio::spawn(async move {
                 engine_ref
-                    .run_scenario_with_profile(
-                        scenario_clone,
-                        scenario_options,
-                        metrics_collector_clone,
-                    )
+                    .run_scenario_with_profile(scenario, scenario_options, metrics_collector_clone)
                     .await
             });
 

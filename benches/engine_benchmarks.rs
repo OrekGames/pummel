@@ -42,6 +42,7 @@ impl MetricsCollector for MockMetricsCollector {
 
     async fn get_step_metrics(
         &self,
+        _scenario_id: &String,
         _step_id: &String,
     ) -> pummel::error::Result<Option<StepMetrics>> {
         Ok(None)

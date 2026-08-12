@@ -154,8 +154,9 @@ async fn run(cli: Cli) -> Result<u8> {
         engine.add_scenario(scenario);
     }
 
-    // --graph: visualize and exit. Done before wiring factories so a config
-    // with an unimplemented telemetry exporter can still be visualized.
+    // --graph: visualize and exit without running the load test.
+    // `apply_config` already ran above, so an enabled-but-invalid telemetry
+    // section still fails before visualization (graph does not skip factory wiring).
     if cli.graph {
         let graph_format = match cli.graph_format {
             GraphOutputFormat::Mermaid => GraphFormat::Mermaid,

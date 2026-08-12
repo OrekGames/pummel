@@ -401,6 +401,98 @@ url = "http://example.test/r/{{vu.id}}/{{data.users.username}}"
 }
 
 #[tokio::test]
+async fn per_vu_wrap_modulo_assigns_rows_when_vus_exceed_fixture() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("users.csv"), "username\nalice\nbob\n").unwrap();
+
+    let config = temp_config(
+        r#"
+[global]
+virtual_users = 4
+duration_seconds = 0
+
+[data_sources.users]
+type = "csv"
+path = "users.csv"
+access = "per_vu"
+exhaustion = "wrap"
+
+[scenarios.s]
+name = "S"
+steps = ["a"]
+
+[steps.a]
+name = "A"
+url = "http://example.test/{{vu.id}}/{{data.users.username}}"
+"#,
+        &dir,
+    );
+    config.validate().unwrap();
+    let (results, seen) = run_config(&config).await;
+    assert_eq!(results.status, RunStatus::Completed);
+    assert_eq!(seen.len(), 4);
+
+    let expected = HashSet::from([
+        "/0/alice".to_string(),
+        "/1/bob".to_string(),
+        "/2/alice".to_string(),
+        "/3/bob".to_string(),
+    ]);
+    let paths: HashSet<String> = seen.into_iter().map(|request| request.path).collect();
+    assert_eq!(paths, expected);
+}
+
+#[tokio::test]
+async fn unseeded_random_binds_only_fixture_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("users.csv"),
+        "username\nalice\nbob\ncarol\n",
+    )
+    .unwrap();
+
+    let config = temp_config(
+        r#"
+[global]
+virtual_users = 6
+duration_seconds = 0
+
+[data_sources.users]
+type = "csv"
+path = "users.csv"
+access = "random"
+exhaustion = "wrap"
+
+[scenarios.s]
+name = "S"
+steps = ["a"]
+
+[steps.a]
+name = "A"
+url = "http://example.test/r/{{data.users.username}}"
+"#,
+        &dir,
+    );
+    config.validate().unwrap();
+    let (results, seen) = run_config(&config).await;
+    assert_eq!(results.status, RunStatus::Completed);
+    assert_eq!(seen.len(), 6);
+
+    let allowed = HashSet::from([
+        "/r/alice".to_string(),
+        "/r/bob".to_string(),
+        "/r/carol".to_string(),
+    ]);
+    for request in seen {
+        assert!(
+            allowed.contains(&request.path),
+            "unseeded random produced out-of-fixture path {}",
+            request.path
+        );
+    }
+}
+
+#[tokio::test]
 async fn data_driven_login_profile_flow_uses_fixture_and_extracted_token() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

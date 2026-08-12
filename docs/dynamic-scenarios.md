@@ -101,6 +101,12 @@ Extractors populate VU-local variables from responses. JSON extractors use the
 same JSON-path subset. Regex extractors store capture group 1 when present, or
 the whole match otherwise.
 
+Extractor variable names must be unique across steps that have no dependency
+ordering. Independent ready steps run concurrently within a VU; two such steps
+writing the same variable name is rejected at `Scenario::validate` (config and
+programmatic paths). Ordered steps (one transitively depends on the other) may
+reuse a name; later writers win.
+
 Branches run before a step sends a request. Supported operators are:
 
 - `exists`
@@ -114,7 +120,20 @@ Branches run before a step sends a request. Supported operators are:
 
 Numeric branch operators parse the actual value and configured value as finite
 numbers. Regex branches match against the same stringified value used by
-templates.
+templates. Invalid `matches_regex` patterns fail validation (and fail closed at
+runtime) instead of silently skipping the step. Prefer
+`BranchCondition::try_matches_regex` in programmatic builders.
+
+## Request Bodies
+
+Dynamic body templates support text, JSON, and opaque binary:
+
+- Text and JSON templates are rendered with the `{{...}}` engine.
+- Non-JSON `Body::Binary` payloads are preserved as
+  `DynamicBodyTemplate::Binary` through static-to-dynamic conversion and are
+  sent verbatim (no template rendering).
+- `Body::Binary` with `Content-Type: application/json` continues to be treated
+  as a JSON template when UTF-8 decoding succeeds.
 
 ## Validation And Linting
 
@@ -123,7 +142,7 @@ references without generating load. `Config::validate()` uses the same analysis.
 The analysis rejects malformed templates, missing data sources, bad fixture
 paths or typed CSV values, invalid JSON paths, missing data paths, unknown
 template variables, impossible branch variables, invalid numeric branch values,
-and invalid regexes.
+invalid regexes, and concurrent extractor name collisions.
 
 ## Non-Goals
 

@@ -258,6 +258,161 @@ async fn duration_cutting_a_pass_returns_truncated_partial_results() {
 }
 
 #[test]
+fn concurrent_extractor_names_are_rejected() {
+    let a = StepBuilder::new(
+        "a",
+        "A",
+        Request::get("http://example.test/a").build().unwrap(),
+    )
+    .extractor(Extractor::json_path("token", "$.token"))
+    .build();
+    let b = StepBuilder::new(
+        "b",
+        "B",
+        Request::get("http://example.test/b").build().unwrap(),
+    )
+    .extractor(Extractor::json_path("token", "$.token"))
+    .build();
+
+    let err = ScenarioBuilder::new("s", "S")
+        .step(a)
+        .step(b)
+        .duration(Duration::from_secs(0))
+        .build()
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("concurrent") || message.contains("token"),
+        "expected concurrent extractor rejection; got {message}"
+    );
+}
+
+#[test]
+fn ordered_steps_may_reuse_extractor_names() {
+    let login = StepBuilder::new(
+        "login",
+        "Login",
+        Request::get("http://example.test/login").build().unwrap(),
+    )
+    .extractor(Extractor::json_path("token", "$.token"))
+    .build();
+    let refresh = StepBuilder::new(
+        "refresh",
+        "Refresh",
+        Request::get("http://example.test/refresh").build().unwrap(),
+    )
+    .dependency("login")
+    .extractor(Extractor::json_path("token", "$.token"))
+    .build();
+
+    ScenarioBuilder::new("s", "S")
+        .step(login)
+        .step(refresh)
+        .duration(Duration::from_secs(0))
+        .build()
+        .expect("ordered writers of the same extractor name must be allowed");
+}
+
+#[test]
+fn invalid_matches_regex_fails_validation() {
+    let bad = BranchCondition::matches_regex("flag", "(unclosed");
+    assert!(
+        BranchCondition::try_matches_regex("flag", "(unclosed").is_err(),
+        "try_matches_regex must reject invalid patterns"
+    );
+
+    let step = StepBuilder::new(
+        "maybe",
+        "Maybe",
+        Request::get("http://example.test/maybe").build().unwrap(),
+    )
+    .branch(bad)
+    .build();
+
+    let err = ScenarioBuilder::new("s", "S")
+        .step(step)
+        .duration(Duration::from_secs(0))
+        .build()
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.to_lowercase().contains("regex") || message.contains("MatchesRegex"),
+        "expected MatchesRegex validation failure; got {message}"
+    );
+}
+
+#[tokio::test]
+async fn binary_body_preserved_through_dynamic_conversion() {
+    #[derive(Default)]
+    struct BinaryClient {
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl HttpClient for BinaryClient {
+        async fn send(&self, request: &Request) -> Result<Response> {
+            let bytes = match request.body() {
+                Body::Binary(bytes) => bytes.to_vec(),
+                Body::Text(text) => text.as_bytes().to_vec(),
+                Body::Json(value) => value.to_string().into_bytes(),
+                Body::Empty => Vec::new(),
+            };
+            self.seen.lock().unwrap().push(bytes);
+            Ok(Response::new(
+                HttpStatus::OK,
+                HttpHeaders::new(),
+                Body::Text("ok".to_string()),
+                Duration::from_millis(1),
+            ))
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let payload = vec![0x00, 0xff, 0x10, 0x80, b'x'];
+    let request = Request::post("http://example.test/bin")
+        .header("Content-Type", "application/octet-stream")
+        .binary(payload.clone())
+        .build()
+        .unwrap();
+
+    // Static-to-dynamic conversion (e.g. adding a header template) must keep bytes.
+    let mut step = StepBuilder::new("bin", "Bin", request).build();
+    step.with_header_template("X-Trace", "1");
+    match step
+        .dynamic_request
+        .as_ref()
+        .and_then(|spec| spec.body_template.as_ref())
+    {
+        Some(pummel::scenario::DynamicBodyTemplate::Binary(bytes)) => {
+            assert_eq!(bytes.as_ref(), payload.as_slice());
+        }
+        other => panic!("expected Binary body template, got {other:?}"),
+    }
+
+    let client = Arc::new(BinaryClient::default());
+    let seen = client.seen.clone();
+    let mut engine = Engine::new();
+    let client_for_factory = client.clone();
+    engine.with_http_client_factory(move || Ok(client_for_factory.clone() as Arc<dyn HttpClient>));
+
+    let scenario = ScenarioBuilder::new("s", "S")
+        .step(step)
+        .duration(Duration::from_secs(0))
+        .build()
+        .unwrap();
+    engine.add_scenario(scenario);
+
+    let results = engine.run_all(ExecutionOptions::default()).await.unwrap();
+    assert_eq!(results.status, RunStatus::Completed);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], payload);
+}
+
+#[test]
 fn config_validate_rejects_semantic_errors() {
     let bad_threshold = pummel::config::Config::from_toml_str(
         r#"

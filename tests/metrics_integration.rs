@@ -187,7 +187,7 @@ async fn proof1_failure_does_not_corrupt_success_stats() {
         .unwrap();
 
     let step = collector
-        .get_step_metrics(&"step1".to_string())
+        .get_step_metrics(&"s".to_string(), &"step1".to_string())
         .await
         .unwrap()
         .unwrap();
@@ -227,7 +227,7 @@ async fn proof2_percentile_nearest_rank_small_exact_values() {
             .unwrap();
     }
     let step = collector
-        .get_step_metrics(&"step1".to_string())
+        .get_step_metrics(&"s".to_string(), &"step1".to_string())
         .await
         .unwrap()
         .unwrap();
@@ -260,7 +260,7 @@ async fn proof2_median_of_two_picks_lower_value() {
         .await
         .unwrap();
     let step = collector
-        .get_step_metrics(&"step1".to_string())
+        .get_step_metrics(&"s".to_string(), &"step1".to_string())
         .await
         .unwrap()
         .unwrap();
@@ -459,7 +459,7 @@ async fn proof6_bounded_histogram_aggregation_not_exact_retention() {
         .await
         .unwrap();
     let step = collector
-        .get_step_metrics(&"step1".to_string())
+        .get_step_metrics(&"s".to_string(), &"step1".to_string())
         .await
         .unwrap()
         .unwrap();

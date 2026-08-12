@@ -52,7 +52,7 @@ pub enum Error {
     #[error("Metrics error: {0}")]
     Metrics(String),
 
-    /// Error when setting up or using OpenTelemetry
+    /// Error when setting up or using a telemetry exporter
     #[error("Telemetry error: {0}")]
     Telemetry(String),
 

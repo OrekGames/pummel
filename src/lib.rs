@@ -3,11 +3,11 @@
 //! A high-throughput, multithreaded HTTP load testing library.
 //!
 //! This library allows users to define test scenarios in a declarative fashion,
-//! either in code or via TOML configuration. It builds a dependency graph which
-//! can be visualized and captures request metrics related to the performance of
-//! the load test. Metrics can be streamed to a pluggable [`telemetry`]
-//! exporter (a real newline-delimited JSON exporter ships in the box; embedders
-//! can implement their own).
+//! either in code or via TOML or YAML configuration. It builds a dependency
+//! graph which can be visualized and captures request metrics related to the
+//! performance of the load test. Metrics can be streamed to a pluggable
+//! [`telemetry`] exporter (a real newline-delimited JSON exporter ships in the
+//! box; embedders can implement their own).
 //!
 //! # Examples
 //!
@@ -59,8 +59,12 @@
 //!
 //! ## Running from a configuration file
 //!
-//! Mirrors the README "Using Configuration Files" snippet. `Config::from_toml`
-//! parses TOML instead.
+//! Mirrors the README "Using Configuration Files" snippet. Prefer
+//! [`Engine::apply_config`](crate::engine::Engine::apply_config) +
+//! [`run_all`](crate::engine::Engine::run_all) when you need CLI-parity knobs
+//! (`abort_on_error`, per-VU client isolation, top-level `target_rps`);
+//! [`Engine::run`](crate::engine::Engine::run) is the narrower convenience path.
+//! `Config::from_toml` parses TOML instead of YAML.
 //!
 //! ```no_run
 //! use pummel::prelude::*;
@@ -134,7 +138,9 @@ pub mod prelude {
     pub use crate::graph::{DependencyGraph, GraphFormat, GraphVisualizer};
     pub use crate::http::{HttpClient, Request, Response};
     pub use crate::logging;
-    pub use crate::metrics::{MetricsCollector, MetricsCollectorFactory, RunStatus, TestResults};
+    pub use crate::metrics::{
+        MetricsCollector, MetricsCollectorFactory, RequestMetrics, RunStatus, TestResults,
+    };
     pub use crate::scenario::{
         BranchCondition, BranchOperator, DynamicBodyTemplate, DynamicRequestSpec, Extractor,
         ExtractorSource, LoadProfile, LoadStage, Scenario, ScenarioBuilder, Step, StepBuilder,
@@ -155,5 +161,11 @@ mod tests {
         // VERSION should be a valid semver string like "0.1.0"
         assert!(VERSION.len() >= 5); // At least "0.0.0"
         assert!(VERSION.contains('.'));
+    }
+
+    #[test]
+    fn prelude_reexports_request_metrics() {
+        // Compile-time coverage that embedders can pull RequestMetrics from prelude.
+        fn _assert_prelude_export(_: prelude::RequestMetrics) {}
     }
 }
