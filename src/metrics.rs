@@ -30,7 +30,7 @@ fn json_wire_len(value: &Value) -> u64 {
     }
     let mut counter = Counter(0);
     // `Value` serialization cannot fail for the standard map/list/primitive shapes.
-    let _ = serde_json::to_writer(&mut counter, value);
+    serde_json::to_writer(&mut counter, value).expect("Value serialization cannot fail");
     counter.0
 }
 
