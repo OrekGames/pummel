@@ -393,7 +393,7 @@ async fn main() -> Result<()> {
 | Scenario VUs / duration / ramp-up / think-time from config | yes | yes |
 | `max_concurrent_requests` from `[http]` | yes | yes |
 | Stage-level load profiles / stage `target_rps` | yes | yes |
-| Top-level open-loop `target_rps` | **no** (hardcoded `None`) | yes |
+| Top-level `target_rps` (request-attempt pacing) | **no** (hardcoded `None`) | yes |
 | `abort_on_error` | **no** (hardcoded `false`) | yes |
 | `isolate_clients_per_user` | **no** (hardcoded `false`) | yes |
 

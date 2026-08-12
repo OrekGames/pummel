@@ -1,6 +1,8 @@
 //! Head-to-head benches for metrics hot-path recording:
-//! - full [`RequestMetrics`] construction + `record_request` (legacy engine path)
-//! - slim [`AttemptSummary`] + `record_attempt_summary` (default collector, no telemetry)
+//! - full [`RequestMetrics`] construction + `record_request`
+//!   (telemetry / custom collectors that require full records)
+//! - slim [`AttemptSummary`] + `record_attempt_summary`
+//!   (default in-memory collector, no telemetry)
 //! - construct+noop vs skip (metrics disabled, no telemetry)
 //!
 //! Both arms stay permanently so comparisons do not depend on baselines.
@@ -121,7 +123,7 @@ fn bench_noop_construct_vs_skip(c: &mut Criterion) {
     let response = sample_response();
     let elapsed = Duration::from_millis(12);
 
-    // Legacy: still build RequestMetrics and await the noop collector.
+    // Historical: still build RequestMetrics and await the noop collector.
     group.bench_function("construct_and_noop_record", |b| {
         b.iter(|| {
             rt.block_on(async {

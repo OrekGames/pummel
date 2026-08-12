@@ -73,8 +73,8 @@ struct Cli {
     #[arg(long)]
     ramp_up: Option<u64>,
 
-    /// Open-loop target arrival rate in requests/second (applies to every
-    /// scenario). Omit for closed-loop pacing driven by think time.
+    /// Aggregate request-attempt starts per second across active scenarios.
+    /// Retries consume permits. Omit for think-time pacing between passes.
     #[arg(long)]
     target_rps: Option<f64>,
 
@@ -90,7 +90,21 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let code = if err.use_stderr() {
+                exit::ERROR
+            } else {
+                exit::OK
+            };
+            if let Err(print_err) = err.print() {
+                eprintln!("error: {print_err}");
+                return ExitCode::from(exit::ERROR);
+            }
+            return ExitCode::from(code);
+        }
+    };
 
     // Set up logging based on verbosity. Logs go to stderr, so stdout carries
     // only results output (see `print_json_results`).

@@ -15,6 +15,7 @@
 //!   4. independent ready steps run concurrently within a VU
 //!   5. step.timeout is enforced per attempt
 //!   6. think-time is never slept past the deadline
+//!   7. request-cap waits never start sends after the deadline
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,7 +25,7 @@ use async_trait::async_trait;
 use pummel::engine::{Engine, ExecutionOptions};
 use pummel::error::Result;
 use pummel::http::{Body, HttpClient, HttpStatus, Request, Response};
-use pummel::metrics::MetricsCollectorFactory;
+use pummel::metrics::{MetricsCollectorFactory, RunStatus};
 use pummel::scenario::{ScenarioBuilder, StepBuilder};
 
 /// A mock client that records total sends, tracks live in-flight concurrency
@@ -256,6 +257,39 @@ async fn proof2b_sanity_request_cap_serialises_requests() {
         1,
         "a request cap of 1 must serialise sends even with {N} VUs (peak={})",
         counters.peak()
+    );
+}
+
+#[tokio::test]
+async fn proof2c_request_cap_wait_respects_run_deadline() {
+    let counters = Counters::default();
+    let mut engine = engine_with(&counters, Duration::from_millis(500));
+
+    let step = StepBuilder::new("s1", "S1", get("https://example.com/1"))
+        .max_retries(0)
+        .timeout(Duration::from_secs(1))
+        .build();
+    let scenario = ScenarioBuilder::new("s", "S")
+        .step(step)
+        .virtual_users(2)
+        .duration(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    engine.add_scenario(scenario);
+
+    let mut options = base_options();
+    options.max_concurrent_requests = 1;
+
+    let results = engine.run_all(options).await.unwrap();
+
+    assert!(
+        matches!(results.status, RunStatus::Truncated { .. }),
+        "a request-cap waiter that reaches the deadline must truncate the run"
+    );
+    assert_eq!(
+        counters.sends(),
+        1,
+        "the waiting VU must not start a request after the deadline"
     );
 }
 
