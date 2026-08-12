@@ -9,7 +9,7 @@ use bytes::Bytes;
 use lru::LruCache;
 use rand::RngExt;
 use serde::de::IgnoredAny;
-use tokio::sync::Semaphore;
+use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -115,6 +115,25 @@ async fn sleep_before_deadline(delay: Duration, deadline: Option<Instant>) -> bo
     !deadline_expired(Some(deadline))
 }
 
+async fn acquire_semaphore_before_deadline(
+    semaphore: &Semaphore,
+    deadline: Option<Instant>,
+) -> std::result::Result<Option<SemaphorePermit<'_>>, AcquireError> {
+    let Some(deadline) = deadline else {
+        return semaphore.acquire().await.map(Some);
+    };
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+
+    match tokio::time::timeout(remaining, semaphore.acquire()).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Options for executing a scenario.
 ///
 /// This struct is `#[non_exhaustive]`: construct it with
@@ -141,9 +160,10 @@ pub struct ExecutionOptions {
     pub ramp_up: Duration,
 
     /// Think time between scenario iterations (simulates a user pausing between
-    /// sessions). In closed-loop mode (the default, when `target_rps` is
-    /// `None`) a VU sleeps this long between passes; it is never slept past the
-    /// run deadline.
+    /// sessions). When `target_rps` is `None` (the default), a VU sleeps this
+    /// long between passes; it is never slept past the run deadline. When
+    /// `target_rps` is set, think time is ignored and pacing is owned by the
+    /// request-attempt rate limiter.
     pub think_time: Duration,
 
     /// Maximum number of simultaneously in-flight requests across ALL virtual
@@ -164,8 +184,11 @@ pub struct ExecutionOptions {
     /// (e.g. distinct cookie/session state) is actually required.
     pub isolate_clients_per_user: bool,
 
-    /// Optional open-loop target arrival rate in requests/second. `None`
-    /// (default) uses closed-loop pacing driven by `think_time`.
+    /// Optional aggregate request-attempt start rate in requests/second.
+    /// When set, each HTTP send attempt (including retries) acquires a shared
+    /// rate-limiter permit before starting. Multi-step iterations therefore
+    /// consume one permit per step attempt. `None` (default) uses think-time
+    /// pacing between scenario passes.
     pub target_rps: Option<f64>,
 }
 
@@ -248,7 +271,7 @@ impl ExecutionOptionsBuilder {
         self
     }
 
-    /// Set the optional open-loop target arrival rate (requests/second).
+    /// Set the optional aggregate request-attempt start rate (requests/second).
     pub fn target_rps(mut self, target_rps: Option<f64>) -> Self {
         self.options.target_rps = target_rps;
         self
@@ -790,17 +813,19 @@ struct VirtualUserContext {
 impl VirtualUserContext {
     /// Create a new virtual user context
     fn new(id: u32, scenario: Arc<Scenario>, shared_state: SharedEngineState) -> Self {
-        let mut step_statuses = HashMap::new();
-        let mut ready_buf = Vec::new();
+        let mut step_statuses = HashMap::with_capacity(scenario.get_steps().len());
+        let mut ready_buf = Vec::with_capacity(scenario.get_root_steps().len());
 
         // Initialize all steps as waiting
         for step in scenario.get_steps() {
             step_statuses.insert(step.id.clone(), StepStatus::Waiting);
         }
 
-        // Mark steps with no dependencies as ready
+        // Mark steps with no dependencies as ready (update in-place to avoid duplicate cloning)
         for step in scenario.get_root_steps() {
-            step_statuses.insert(step.id.clone(), StepStatus::Ready);
+            if let Some(status) = step_statuses.get_mut(&step.id) {
+                *status = StepStatus::Ready;
+            }
             ready_buf.push(step.id.clone());
         }
 
@@ -1125,8 +1150,20 @@ impl VirtualUserContext {
                     break;
                 }
                 let _permit = match &semaphore {
-                    Some(sem) => match sem.acquire().await {
-                        Ok(permit) => Some(permit),
+                    Some(sem) => match acquire_semaphore_before_deadline(sem, deadline).await {
+                        Ok(Some(permit)) => {
+                            // A permit becoming available at the boundary must
+                            // not allow a request to start after the run ended.
+                            if deadline_expired(deadline) {
+                                truncated = true;
+                                break;
+                            }
+                            Some(permit)
+                        }
+                        Ok(None) => {
+                            truncated = true;
+                            break;
+                        }
                         Err(err) => {
                             last_error = Some(Error::engine(format!(
                                 "Failed to acquire semaphore permit: {}",
@@ -1462,11 +1499,11 @@ impl VirtualUserContext {
     ///   and return. This preserves the exact per-attempt / per-VU request
     ///   counts the Tier-1/2A verification tests assert on.
     ///
-    /// Pacing between iterations (never past the deadline):
-    /// * closed-loop (default) — sleep `think_time` between passes;
-    /// * open-loop (`target_rps`) — schedule iteration *start* times at a fixed
-    ///   cadence decoupled from response latency, mitigating coordinated
-    ///   omission.
+    /// Pacing (never past the deadline):
+    /// * default (`target_rps` unset) — sleep `think_time` between scenario
+    ///   passes;
+    /// * `target_rps` set — pace each HTTP request-attempt start via the shared
+    ///   rate limiter (retries consume permits; think time is ignored).
     async fn run(&mut self, deadline: Option<Instant>) -> Result<bool> {
         self.status = VirtualUserStatus::Active;
 
@@ -1517,10 +1554,10 @@ impl VirtualUserContext {
             }
 
             // (5) Pace before the next iteration, never sleeping past the
-            //     deadline. Think time is closed-loop only; open-loop pacing is
-            //     owned by `target_rps` / the rate limiter.
+            //     deadline. Think time applies only when `target_rps` is unset;
+            //     request-attempt pacing is owned by the rate limiter.
             if self.options.target_rps.is_none() && self.options.think_time.as_millis() > 0 {
-                // Closed-loop: think between sessions, but not past the deadline.
+                // Think between sessions, but not past the deadline.
                 if now + self.options.think_time >= deadline {
                     break;
                 }
@@ -1911,7 +1948,7 @@ impl Engine {
     /// | Scenario VUs / duration / ramp-up / think-time from config | yes | yes |
     /// | `max_concurrent_requests` from `[http]` | yes | yes |
     /// | Stage-level load profiles / stage `target_rps` | yes | yes |
-    /// | Top-level open-loop `ExecutionOptions::target_rps` | **no** (always `None`) | yes (`--target-rps`) |
+    /// | Top-level `ExecutionOptions::target_rps` (request-attempt pacing) | **no** (always `None`) | yes (`--target-rps`) |
     /// | `abort_on_error` | **no** (always `false`) | yes |
     /// | `isolate_clients_per_user` | **no** (always `false`) | yes |
     ///

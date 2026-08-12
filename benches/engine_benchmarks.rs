@@ -4,9 +4,11 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use pummel::engine::{Engine, ExecutionOptions};
 use pummel::http::{Body, HttpClient, HttpStatus, Request, Response};
 use pummel::metrics::{
-    MetricsCollector, RequestMetrics, RunStatus, ScenarioMetrics, StepMetrics, TestResults,
+    InMemoryMetricsCollector, MetricsCollector, MetricsCollectorFactory, RequestMetrics, RunStatus,
+    ScenarioMetrics, StepMetrics, TestResults,
 };
 use pummel::scenario::{Scenario, ScenarioBuilder, StepBuilder};
+use pummel::telemetry::NoopTelemetryExporter;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -468,6 +470,60 @@ fn bench_dag_scheduling(c: &mut Criterion) {
     group.finish();
 }
 
+/// End-to-end recording-mode comparison on the public engine API:
+/// default `AttemptSummary` path (no telemetry) vs attached noop telemetry,
+/// which forces full `RequestMetrics` construction + export.
+///
+/// Filter locally with:
+/// `cargo bench --bench engine_benchmarks -- execute_step_recording_mode`
+fn bench_execute_step_recording_mode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("execute_step_recording_mode");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(5));
+
+    let rt = Runtime::new().unwrap();
+    let options = ExecutionOptions::builder()
+        .max_concurrent_requests(0)
+        .build();
+
+    let summary_engine = {
+        let scenario = create_test_scenario(1, false, 1);
+        let mut engine = Engine::new();
+        engine.add_scenario(scenario);
+        engine.with_http_client_factory(|| Ok(Arc::new(MockHttpClient)));
+        engine.with_metrics_collector_factory(MetricsCollectorFactory::create_in_memory);
+        engine
+    };
+
+    let telemetry_engine = {
+        let scenario = create_test_scenario(1, false, 1);
+        let mut engine = Engine::new();
+        engine.add_scenario(scenario);
+        engine.with_http_client_factory(|| Ok(Arc::new(MockHttpClient)));
+        engine.with_metrics_collector_factory(|| Arc::new(InMemoryMetricsCollector::new()));
+        engine.with_telemetry_exporter(Arc::new(NoopTelemetryExporter::new()));
+        engine
+    };
+
+    group.bench_function("summary_no_telemetry", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = summary_engine.run_all(options.clone()).await;
+            });
+        });
+    });
+
+    group.bench_function("full_with_noop_telemetry", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = telemetry_engine.run_all(options.clone()).await;
+            });
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_scenario_creation,
@@ -475,5 +531,6 @@ criterion_group!(
     bench_run_all,
     bench_run_all_virtual_users,
     bench_dag_scheduling,
+    bench_execute_step_recording_mode,
 );
 criterion_main!(benches);

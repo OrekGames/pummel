@@ -1,7 +1,7 @@
 //! Throughput-focused Criterion benches for hot-path changes:
 //! - rate limiter contention under many concurrent waiters
-//! - semaphore vs rate-limiter acquire ordering (permanent head-to-head)
-//! - response body materialization (`to_vec` vs `bytes::Bytes`)
+//! - semaphore vs rate-limiter acquire ordering (historical vs production)
+//! - response body materialization (historical `to_vec` vs production `Bytes`)
 //!
 //! Baseline workflow:
 //! ```text
@@ -74,7 +74,8 @@ fn bench_rate_limiter_contention(c: &mut Criterion) {
     group.finish();
 }
 
-/// Head-to-head: hold the in-flight semaphore during rate wait vs rate-then-sem.
+/// Head-to-head: hold the in-flight semaphore during rate wait (historical)
+/// vs rate-then-sem (production).
 ///
 /// Both arms stay permanently so the comparison does not depend on baselines.
 fn bench_semaphore_rate_ordering(c: &mut Criterion) {
@@ -95,7 +96,7 @@ fn bench_semaphore_rate_ordering(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(TASKS as u64));
 
-    group.bench_function("sem_then_rate", |b| {
+    group.bench_function("historical_sem_then_rate", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let limiter = RateLimiter::new(TARGET_RPS).expect("valid rate");
@@ -105,7 +106,7 @@ fn bench_semaphore_rate_ordering(c: &mut Criterion) {
                     let limiter = Arc::clone(&limiter);
                     let semaphore = Arc::clone(&semaphore);
                     handles.push(tokio::spawn(async move {
-                        // Old engine order: concurrency permit held across rate sleep.
+                        // Historical order: concurrency permit held across rate sleep.
                         let _permit = semaphore.acquire().await.expect("sem");
                         let ok = limiter.acquire_before_deadline(None).await;
                         yield_now().await;
@@ -123,7 +124,7 @@ fn bench_semaphore_rate_ordering(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("rate_then_sem", |b| {
+    group.bench_function("production_rate_then_sem", |b| {
         b.iter(|| {
             rt.block_on(async {
                 let limiter = RateLimiter::new(TARGET_RPS).expect("valid rate");
@@ -133,7 +134,7 @@ fn bench_semaphore_rate_ordering(c: &mut Criterion) {
                     let limiter = Arc::clone(&limiter);
                     let semaphore = Arc::clone(&semaphore);
                     handles.push(tokio::spawn(async move {
-                        // Fixed order: pace first, then take an in-flight slot.
+                        // Production order: pace first, then take an in-flight slot.
                         let ok = limiter.acquire_before_deadline(None).await;
                         let _permit = semaphore.acquire().await.expect("sem");
                         yield_now().await;
@@ -164,31 +165,39 @@ fn bench_response_body_materialize(c: &mut Criterion) {
         let payload = Bytes::from(vec![0u8; size]);
         group.throughput(Throughput::Bytes(size as u64));
 
-        // Old DefaultHttpClient path: Bytes -> Vec -> Body::Binary, then clone.
-        group.bench_with_input(BenchmarkId::new("to_vec", size), &payload, |b, payload| {
-            b.iter(|| {
-                let body = Body::Binary(payload.to_vec().into());
-                let cloned = body.clone();
-                let len = match (&body, &cloned) {
-                    (Body::Binary(a), Body::Binary(b)) => a.len() + b.len(),
-                    _ => 0,
-                };
-                black_box(len)
-            });
-        });
+        // Historical DefaultHttpClient path: Bytes -> Vec -> Body::Binary, then clone.
+        group.bench_with_input(
+            BenchmarkId::new("historical_to_vec", size),
+            &payload,
+            |b, payload| {
+                b.iter(|| {
+                    let body = Body::Binary(payload.to_vec().into());
+                    let cloned = body.clone();
+                    let len = match (&body, &cloned) {
+                        (Body::Binary(a), Body::Binary(b)) => a.len() + b.len(),
+                        _ => 0,
+                    };
+                    black_box(len)
+                });
+            },
+        );
 
-        // New path: store Bytes directly (cheap clone via refcount).
-        group.bench_with_input(BenchmarkId::new("bytes", size), &payload, |b, payload| {
-            b.iter(|| {
-                let body = Body::Binary(payload.clone());
-                let cloned = body.clone();
-                let len = match (&body, &cloned) {
-                    (Body::Binary(a), Body::Binary(b)) => a.len() + b.len(),
-                    _ => 0,
-                };
-                black_box(len)
-            });
-        });
+        // Production path: store Bytes directly (cheap clone via refcount).
+        group.bench_with_input(
+            BenchmarkId::new("production_bytes", size),
+            &payload,
+            |b, payload| {
+                b.iter(|| {
+                    let body = Body::Binary(payload.clone());
+                    let cloned = body.clone();
+                    let len = match (&body, &cloned) {
+                        (Body::Binary(a), Body::Binary(b)) => a.len() + b.len(),
+                        _ => 0,
+                    };
+                    black_box(len)
+                });
+            },
+        );
     }
 
     group.finish();
