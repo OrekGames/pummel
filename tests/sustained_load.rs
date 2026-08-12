@@ -177,12 +177,12 @@ async fn think_time_not_slept_past_deadline() {
 }
 
 // ---------------------------------------------------------------------------
-// target_rps paces iteration start times so offered load is decoupled from response latency and stays well below the
-// unlimited closed-loop rate over the same window.
+// target_rps paces request-attempt starts so offered load stays well below the
+// unlimited think-time-paced rate over the same window.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn open_loop_target_rps_paces_offered_load() {
+async fn target_rps_paces_offered_load() {
     let sends = Arc::new(AtomicUsize::new(0));
     let sends_factory = sends.clone();
 
@@ -203,8 +203,8 @@ async fn open_loop_target_rps_paces_offered_load() {
     .max_retries(0)
     .build();
 
-    // 1 VU, 400ms window, target 50 rps => interval 20ms => ~20 iterations.
-    // Unlimited closed-loop over the same window would issue hundreds.
+    // 1 VU, 400ms window, target 50 rps => interval 20ms => ~20 attempt starts.
+    // Unlimited think-time pacing over the same window would issue hundreds.
     let scenario = ScenarioBuilder::new("s", "S")
         .step(step)
         .virtual_users(1)
@@ -224,7 +224,7 @@ async fn open_loop_target_rps_paces_offered_load() {
     assert!(
         (5..=60).contains(&total),
         "target_rps=50 over 400ms should pace to ~20 sends (bounded well below \
-         the unlimited closed-loop rate); got {total}"
+         the unlimited think-time-paced rate); got {total}"
     );
 }
 
