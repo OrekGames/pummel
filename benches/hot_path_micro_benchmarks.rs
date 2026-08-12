@@ -1,6 +1,7 @@
 //! Microbenchmarks isolating remaining hot-path costs:
-//! - regex compile-per-match vs cached `Regex`
-//! - JSON serialize-per-send vs pre-serialized `Bytes`
+//! - regex compile-per-match vs cached `Regex` (production prefers precompiled/cached)
+//! - JSON serialize-per-send (dynamic/reqwest `.json()` style) vs pre-serialized
+//!   `Bytes` (static `RequestBuilder::json` production path)
 //! - HTTP send-path Request clone + reqwest materialize clones
 //!
 //! Both arms stay permanently so head-to-head comparisons do not need baselines.
@@ -61,7 +62,8 @@ fn bench_json_request_body(c: &mut Criterion) {
 
     group.bench_function("serialize_each_send", |b| {
         b.iter(|| {
-            // Mirrors RequestBuilder::json + reqwest .json(): Value then bytes every send.
+            // Models dynamic/reqwest `.json()` re-serialize-each-send, not the
+            // static RequestBuilder::json production path.
             let value = serde_json::to_value(black_box(&payload)).expect("to_value");
             let bytes = serde_json::to_vec(&value).expect("to_vec");
             black_box(bytes.len())
@@ -71,7 +73,7 @@ fn bench_json_request_body(c: &mut Criterion) {
     let pre_serialized = Bytes::from(serde_json::to_vec(&payload).expect("to_vec"));
     group.bench_function("pre_serialized_bytes", |b| {
         b.iter(|| {
-            // Hot path after fix: clone refcounted Bytes into the request builder.
+            // Production static path: clone refcounted Bytes into the send builder.
             let body = pre_serialized.clone();
             black_box(body.len())
         });

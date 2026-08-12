@@ -166,7 +166,7 @@ fn proof1_client_spec_maps_http_config_fields() {
     let http = HttpConfig {
         connection_timeout_ms: 1234,
         pool_idle_timeout_seconds: 45,
-        max_connections_per_host: 7,
+        pool_max_idle_per_host: 7,
         use_http2: true,
         verify_ssl: false,
         ..HttpConfig::default()
