@@ -157,10 +157,10 @@ impl RequestMetrics {
         let method = request.method().as_str().to_string();
         let mut safe_url = request.url().clone();
         if safe_url.password().is_some() {
-            let _ = safe_url.set_password(None);
+            safe_url.set_password(None).ok();
         }
         if !safe_url.username().is_empty() {
-            let _ = safe_url.set_username("");
+            safe_url.set_username("").ok();
         }
         let url = safe_url.as_str().to_string();
 
