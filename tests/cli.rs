@@ -14,6 +14,10 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_pummel")
 }
 
+fn run_cli(args: &[&str]) -> std::process::Output {
+    Command::new(bin()).args(args).output().unwrap()
+}
+
 /// Write `contents` to a temp file with the given extension so the CLI's
 /// format detection (by extension) works.
 fn config_file(extension: &str, contents: &str) -> NamedTempFile {
@@ -40,6 +44,61 @@ name = "Home"
 method = "GET"
 url = "/"
 "#;
+
+#[test]
+fn missing_config_exits_one() {
+    let out = run_cli(&[]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--config"),
+        "missing-argument details absent from stderr"
+    );
+}
+
+#[test]
+fn unknown_option_exits_one() {
+    let out = run_cli(&["--definitely-unknown"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+        "unknown-option details absent from stderr"
+    );
+}
+
+#[test]
+fn invalid_value_exits_one() {
+    let out = run_cli(&["--config", "unused.toml", "--format", "xml"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid value"),
+        "invalid-value details absent from stderr"
+    );
+}
+
+#[test]
+fn help_exits_zero() {
+    let out = run_cli(&["--help"]);
+
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Usage:"),
+        "help text absent from stdout"
+    );
+}
+
+#[test]
+fn version_exits_zero() {
+    let out = run_cli(&["--version"]);
+
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_PKG_VERSION")),
+        "version text absent from stdout"
+    );
+}
 
 #[test]
 fn dry_run_valid_config_exits_zero_with_summary() {

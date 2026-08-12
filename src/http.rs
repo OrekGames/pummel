@@ -532,7 +532,7 @@ impl ClientSpec {
         Ok(Self {
             connect_timeout: Duration::from_millis(http.connection_timeout_ms),
             pool_idle_timeout: Duration::from_secs(http.pool_idle_timeout_seconds),
-            pool_max_idle_per_host: http.max_connections_per_host,
+            pool_max_idle_per_host: http.pool_max_idle_per_host,
             use_http2: http.use_http2,
             verify_ssl: http.verify_ssl,
             default_headers,
@@ -657,11 +657,9 @@ impl HttpClient for DefaultHttpClient {
         let status = resp.status();
         let headers = resp.headers().clone();
 
-        // Read the response body. We keep the raw bytes rather than
-        // speculatively deserializing every payload as JSON: parsing on the
-        // hot path is the largest per-request CPU cost and is lossy (text
-        // like "123"/"null" would be coerced into a JSON body). Callers parse
-        // on demand via Response::json()/text().
+        // Keep the raw response bytes. Speculative JSON deserialization would
+        // be lossy for text like "123"/"null" and move parse cost onto every
+        // send; callers parse on demand via Response::json()/text().
         let body = if status == StatusCode::NO_CONTENT {
             Body::Empty
         } else {
@@ -776,7 +774,7 @@ mod tests {
         let http = HttpConfig {
             connection_timeout_ms: 1500,
             pool_idle_timeout_seconds: 45,
-            max_connections_per_host: 7,
+            pool_max_idle_per_host: 7,
             use_http2: true,
             verify_ssl: false,
             ..HttpConfig::default()

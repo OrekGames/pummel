@@ -116,7 +116,7 @@ async fn multi_vu_sustained_load_real_http_client() {
     .build();
 
     // A real time-boxed run: 4 VUs generate load for 1s with a short ramp,
-    // looping the DAG many times (closed loop, no think time).
+    // looping the DAG many times (response-paced; no think_time, no target_rps).
     let scenario = ScenarioBuilder::new("sustained", "Sustained Load")
         .step(step1)
         .step(step2)
