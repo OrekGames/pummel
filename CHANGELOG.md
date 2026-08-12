@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   step-id-only lookup returned the first match when the same step id appeared
   in multiple scenarios. Custom `MetricsCollector` implementations and mocks
   must update their trait impl signatures.
+- **Breaking:** `[http].max_connections_per_host` and
+  `HttpConfig::max_connections_per_host` are now
+  `pool_max_idle_per_host`. The setting has always controlled reqwest's idle
+  connection-pool capacity, not simultaneous live connections; use
+  `max_concurrent_requests` to cap in-flight requests.
+- Docs: align `target_rps` wording with aggregate request-attempt pacing
+  semantics (retries consume permits; no pacing behavior change).
+- Benchmarks: relabel historical vs production Criterion arms and add focused
+  baselines for same-key `AttemptSummary` recording and telemetry-on full
+  metrics construction (measurement only; no hot-path optimizations).
 
 ## [0.1.0] - 2026-07-06
 

@@ -1,4 +1,4 @@
-//! End-to-end coverage for open-loop think-time interaction and `LoadProfile`.
+//! End-to-end coverage for `target_rps` think-time interaction and `LoadProfile`.
 //!
 //! Drives the public engine API through the mock HTTP client factory and asserts
 //! on observable send counts, wall-clock duration, and aggregate `RunStatus`.
@@ -73,11 +73,11 @@ fn base_options() -> ExecutionOptions {
         .build()
 }
 
-/// Open-loop load must ignore think time. A think_time larger than the run
-/// window would otherwise end the VU after the first pass (closed-loop
-/// deadline guard), starving open-loop arrival pacing.
+/// `target_rps` pacing must ignore think time. A think_time larger than the run
+/// window would otherwise end the VU after the first pass (think-time deadline
+/// guard), starving request-attempt pacing.
 #[tokio::test]
-async fn open_loop_ignores_non_zero_think_time() {
+async fn target_rps_ignores_non_zero_think_time() {
     let sends = Arc::new(AtomicUsize::new(0));
     let mut engine = counting_engine(sends.clone(), Duration::from_millis(1));
 
@@ -86,7 +86,7 @@ async fn open_loop_ignores_non_zero_think_time() {
         .virtual_users(1)
         .duration(Duration::from_millis(400))
         .ramp_up(Duration::from_secs(0))
-        // Far larger than the run window — must not gate open-loop iterations.
+        // Far larger than the run window — must not gate paced attempt starts.
         .think_time(Duration::from_secs(5))
         .build()
         .unwrap();
@@ -102,7 +102,7 @@ async fn open_loop_ignores_non_zero_think_time() {
 
     assert!(
         elapsed < Duration::from_secs(2),
-        "open-loop run must not sleep think_time; took {elapsed:?}"
+        "target_rps run must not sleep think_time; took {elapsed:?}"
     );
     assert!(
         (5..=60).contains(&total),
@@ -110,7 +110,7 @@ async fn open_loop_ignores_non_zero_think_time() {
     );
     assert!(
         results.total_requests >= 5,
-        "results should reflect paced open-loop traffic; got {}",
+        "results should reflect paced request-attempt traffic; got {}",
         results.total_requests
     );
 }
@@ -174,7 +174,7 @@ async fn load_profile_runs_stages_sequentially() {
     );
     assert!(
         !matches!(results.status, RunStatus::Failed { .. }),
-        "staged open-loop run should not fail; got {:?}",
+        "staged target_rps run should not fail; got {:?}",
         results.status
     );
     assert_eq!(results.total_requests, total as u64);
@@ -193,13 +193,13 @@ async fn load_profile_stage_overrides_apply() {
             virtual_users: Some(2),
             target_rps: Some(10.0),
             ramp_up_seconds: Some(0),
-            // Non-zero think time must still be ignored under stage open-loop.
+            // Non-zero think time must still be ignored under stage target_rps.
             think_time_ms: Some(5_000),
         }],
     };
 
-    // Scenario baseline is closed-loop / single VU / zero duration; the stage
-    // must supply the effective load parameters.
+    // Scenario baseline is think-time paced / single VU / zero duration; the
+    // stage must supply the effective load parameters.
     let scenario = ScenarioBuilder::new("override", "Override")
         .step(single_step("s1"))
         .virtual_users(1)
@@ -218,7 +218,7 @@ async fn load_profile_stage_overrides_apply() {
 
     assert!(
         elapsed < Duration::from_secs(3),
-        "stage think_time_ms must not extend an open-loop stage; took {elapsed:?}"
+        "stage think_time_ms must not extend a target_rps stage; took {elapsed:?}"
     );
     assert!(
         (4..=40).contains(&total),
@@ -227,7 +227,7 @@ async fn load_profile_stage_overrides_apply() {
     assert_eq!(results.total_virtual_users, 2);
 }
 
-/// Closed-loop stages that exit via the think-time deadline guard complete
+/// Think-time-paced stages that exit via the think-time deadline guard complete
 /// cleanly; the profile aggregate stays `Completed`.
 #[tokio::test]
 async fn load_profile_aggregate_status_completed() {
