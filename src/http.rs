@@ -290,13 +290,15 @@ impl RequestBuilder {
             return Err(err);
         }
 
-        let url = Url::parse(&self.url)
-            .map_err(|e| Error::config(format!("Invalid request URL '{}': {e}", self.url)))?;
+        let url = match Url::parse(&self.url) {
+            Ok(url) => url,
+            Err(err) => return Err(invalid_request_url(&self.url, err)),
+        };
         if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
-            return Err(Error::config(format!(
-                "Request URL '{}' must be an absolute http(s) URL",
-                self.url
-            )));
+            return Err(invalid_request_url(
+                &self.url,
+                "missing http(s) scheme or host",
+            ));
         }
 
         Ok(Request {
@@ -309,6 +311,15 @@ impl RequestBuilder {
             metadata: Arc::new(self.metadata),
         })
     }
+}
+
+/// Actionable error for a step/request URL that is not an absolute http(s) URL.
+fn invalid_request_url(raw: &str, detail: impl fmt::Display) -> Error {
+    Error::config(format!(
+        "Request URL '{raw}' is not a valid absolute http(s) URL ({detail}). \
+         Use a full URL such as https://example.com/path, or set [global] base_url \
+         (for example \"https://api.example.com\") and a path like \"/path\"."
+    ))
 }
 
 /// HTTP response
@@ -758,13 +769,24 @@ mod tests {
         // Empty / unparseable / relative / missing-scheme targets must error
         // instead of being silently rewritten to a placeholder host.
         for bad in ["", "not a url", "/api/resource", "www.example.com"] {
+            let err = Request::get(bad)
+                .build()
+                .expect_err(&format!("expected error for target {bad:?}"))
+                .to_string();
             assert!(
-                Request::get(bad).build().is_err(),
-                "expected error for target {bad:?}"
+                err.contains("absolute http(s) URL") && err.contains("[global] base_url"),
+                "expected actionable URL hint for {bad:?}, got {err}"
             );
         }
         // "localhost:8080" parses with scheme "localhost" and no host: reject it.
-        assert!(Request::get("localhost:8080").build().is_err());
+        let err = Request::get("localhost:8080")
+            .build()
+            .expect_err("localhost:8080 must be rejected")
+            .to_string();
+        assert!(
+            err.contains("absolute http(s) URL") && err.contains("[global] base_url"),
+            "expected actionable URL hint for localhost:8080, got {err}"
+        );
     }
 
     #[test]

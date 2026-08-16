@@ -236,3 +236,102 @@ fn unsupported_extension_is_rejected() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn relative_step_url_without_base_explains_base_url() {
+    let toml = r#"
+[scenarios.s]
+name = "S"
+steps = ["a"]
+
+[steps.a]
+name = "A"
+method = "GET"
+url = "/api"
+"#;
+    let cfg = config_file("toml", toml);
+    let out = Command::new(bin())
+        .arg("--config")
+        .arg(cfg.path())
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[global] base_url") && stderr.contains("/api"),
+        "relative URL error should hint at base_url: {stderr}"
+    );
+}
+
+#[test]
+fn duration_string_explains_integer_seconds() {
+    let toml = r#"
+[global]
+duration_seconds = "30s"
+
+[scenarios.s]
+name = "S"
+steps = ["a"]
+
+[steps.a]
+name = "A"
+method = "GET"
+url = "https://example.com/"
+"#;
+    let cfg = config_file("toml", toml);
+    let out = Command::new(bin())
+        .arg("--config")
+        .arg(cfg.path())
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("duration_seconds") && stderr.contains("not a string"),
+        "duration parse error should hint at integer seconds: {stderr}"
+    );
+}
+
+#[test]
+fn unsupported_telemetry_exporter_lists_supported_values() {
+    let toml = r#"
+[telemetry]
+enabled = true
+exporter = "otlp"
+
+[scenarios.s]
+name = "S"
+steps = ["a"]
+
+[steps.a]
+name = "A"
+method = "GET"
+url = "https://example.com/"
+"#;
+    let cfg = config_file("toml", toml);
+    let out = Command::new(bin())
+        .arg("--config")
+        .arg(cfg.path())
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("json, console, noop, none") && stderr.contains("otlp"),
+        "telemetry error should list supported exporters: {stderr}"
+    );
+}
+
+#[test]
+fn missing_config_file_includes_path() {
+    let out = run_cli(&["--config", "does-not-exist-pummel.toml", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does-not-exist-pummel.toml") && stderr.contains("--config"),
+        "missing file error should include the path: {stderr}"
+    );
+}

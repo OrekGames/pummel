@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Benchmarks: relabel historical vs production Criterion arms and add focused
   baselines for same-key `AttemptSummary` recording and telemetry-on full
   metrics construction (measurement only; no hot-path optimizations).
+- Docs: lead install instructions with source/git until tag `v0.1.0` exists;
+  crates.io and binary installers are documented as post-release only.
+- CLI/config errors for relative URLs, duration strings, telemetry allow-lists,
+  and missing config files now include a fix hint.
 
 ## [0.1.0] - 2026-07-06
 
