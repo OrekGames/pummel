@@ -463,3 +463,8 @@ See the `examples/` directory for complete working examples:
 ## License
 
 This project is licensed under the MIT License.
+
+
+## Expand and clarify example configs under examples/
+
+Documentation reference and guidelines for #32.
