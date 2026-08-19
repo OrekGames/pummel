@@ -265,7 +265,9 @@ fn load_config(path: &Path) -> Result<Config> {
         "yaml" | "yml" => Config::from_yaml(path),
         "toml" => Config::from_toml(path),
         _ => Err(Error::config(format!(
-            "Unsupported file extension: {extension}. Supported formats are YAML and TOML"
+            "Unsupported config file extension '{extension}' for '{}'. \
+             Use a .yaml, .yml, or .toml file with --config",
+            path.display()
         ))),
     }
 }

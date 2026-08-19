@@ -16,46 +16,13 @@ A high-throughput, multithreaded HTTP load testing library and CLI tool for Rust
 
 ## Installation
 
-**Preferred for Rust users:** install from [crates.io](https://crates.io/crates/pummel):
+> **Pre-release:** tag `v0.1.0` does not exist yet. Pummel is **not** on
+> [crates.io](https://crates.io/crates/pummel) and there is no checksum-verified
+> [GitHub Release](https://github.com/OrekGames/pummel/releases). `cargo install
+> pummel` and the binary installers fail until that tag ships. Install from
+> source or git today.
 
-```bash
-cargo install pummel --locked
-```
-
-> The first crates.io publish and checksum-verified GitHub Release are forthcoming
-> until tag `v0.1.0` exists. Until then, build from source.
-
-### Library
-
-Add the library to your `Cargo.toml`:
-
-```toml
-[dependencies]
-pummel = "0.1.0"
-```
-
-### Automated binary installers
-
-Installers discover the latest stable GitHub Release, download the platform
-archive and `checksums-sha256.txt`, verify the exact-filename SHA-256, and install
-the binary. No `minisign` (or other signing tool) is required.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/OrekGames/pummel/main/scripts/install.sh | bash
-```
-
-Windows (PowerShell):
-
-```powershell
-irm https://raw.githubusercontent.com/OrekGames/pummel/main/scripts/install.ps1 | iex
-```
-
-See the [Installation Documentation](docs/installation.md) for manual verification
-steps and the maintainer release checklist.
-
-### Build from Source
-
-Build the CLI tool from source:
+### Build from source (works today)
 
 ```bash
 git clone https://github.com/OrekGames/pummel.git
@@ -63,11 +30,49 @@ cd pummel
 cargo build --release
 ```
 
-The CLI binary will be available at `target/release/pummel`.
+The CLI binary is `target/release/pummel`. Commands below use that path.
+
+Install the CLI from git onto your Cargo bin directory:
+
+```bash
+cargo install --git https://github.com/OrekGames/pummel.git --locked pummel
+```
+
+Then invoke `pummel` instead of `./target/release/pummel`.
+
+Library users, depend on git until the first crates.io publish:
+
+```toml
+[dependencies]
+pummel = { git = "https://github.com/OrekGames/pummel.git" }
+```
+
+Optional: build the CLI image with `docker/Dockerfile` (see
+[Installation](docs/installation.md)).
+
+### After `v0.1.0` (not available yet)
+
+When the first release exists, Rust users can switch to:
+
+```bash
+cargo install pummel --locked
+```
+
+```toml
+[dependencies]
+pummel = "0.1.0"
+```
+
+Checksum-verified binary installers will then discover the latest stable GitHub
+Release. Until then they exit with “No stable vMAJOR.MINOR.PATCH releases
+found”. Full installer, checksum, and maintainer steps:
+[Installation](docs/installation.md).
 
 ## CLI Usage
 
 The `pummel` tool allows you to run load tests using configuration files.
+Examples below use `./target/release/pummel` from a source build; use `pummel`
+if you installed with `cargo install --git`.
 
 ### Basic Usage
 

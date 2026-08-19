@@ -86,8 +86,7 @@ impl Config {
     /// Load configuration from a TOML file
     pub fn from_toml<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path)
-            .map_err(|e| Error::config(format!("Failed to read config file: {e}")))?;
+        let content = read_config_file(path)?;
 
         let mut config = Self::from_toml_str(&content)?;
         config.source_dir = Some(config_source_dir(path)?);
@@ -96,7 +95,7 @@ impl Config {
 
     /// Load configuration from a TOML string
     pub fn from_toml_str(content: &str) -> Result<Self> {
-        toml::from_str(content).map_err(|e| Error::config(format!("Failed to parse TOML: {e}")))
+        toml::from_str(content).map_err(|e| parse_config_error("TOML", e))
     }
 
     /// Save configuration to a TOML file
@@ -111,8 +110,7 @@ impl Config {
     /// Load configuration from a YAML file
     pub fn from_yaml<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path)
-            .map_err(|e| Error::config(format!("Failed to read config file: {e}")))?;
+        let content = read_config_file(path)?;
 
         let mut config = Self::from_yaml_str(&content)?;
         config.source_dir = Some(config_source_dir(path)?);
@@ -121,8 +119,7 @@ impl Config {
 
     /// Load configuration from a YAML string
     pub fn from_yaml_str(content: &str) -> Result<Self> {
-        serde_yaml::from_str(content)
-            .map_err(|e| Error::config(format!("Failed to parse YAML: {e}")))
+        serde_yaml::from_str(content).map_err(|e| parse_config_error("YAML", e))
     }
 
     /// Save configuration to a YAML file
@@ -188,7 +185,9 @@ impl Config {
                 "json" | "console" | "noop" | "none" => {}
                 other => {
                     return Err(Error::config(format!(
-                        "Unsupported telemetry exporter '{other}'"
+                        "Unsupported telemetry exporter '{other}'. \
+                         Supported values: json, console, noop, none. \
+                         OpenTelemetry (otlp) and Prometheus are not implemented yet"
                     )));
                 }
             }
@@ -197,7 +196,8 @@ impl Config {
             "drop" | "block" => {}
             other => {
                 return Err(Error::config(format!(
-                    "Unsupported telemetry backpressure '{other}'"
+                    "Unsupported telemetry backpressure '{other}'. \
+                     Supported values: drop, block"
                 )));
             }
         }
@@ -352,13 +352,13 @@ impl Config {
         } else if url_has_template {
             join_url_template(&self.global.base_url, &config.url)?
         } else {
-            let base = Url::parse(&self.global.base_url).map_err(|e| {
-                Error::config(format!("Invalid base_url '{}': {e}", self.global.base_url))
-            })?;
+            let base = Url::parse(&self.global.base_url)
+                .map_err(|e| invalid_base_url(&self.global.base_url, e))?;
             base.join(&config.url)
                 .map_err(|e| {
                     Error::config(format!(
-                        "Failed to join base_url '{}' with step '{}' url '{}': {e}",
+                        "Failed to join [global] base_url '{}' with step '{}' url '{}': {e}. \
+                         Use an absolute http(s) base_url and a path or absolute step URL.",
                         self.global.base_url, id, config.url
                     ))
                 })?
@@ -1625,8 +1625,7 @@ fn join_url_template(base_url: &str, url: &str) -> Result<String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         return Ok(url.to_string());
     }
-    let base = Url::parse(base_url)
-        .map_err(|e| Error::config(format!("Invalid base_url '{base_url}': {e}")))?;
+    let base = Url::parse(base_url).map_err(|e| invalid_base_url(base_url, e))?;
     let mut joined = base.to_string();
     if !joined.ends_with('/') && !url.starts_with('/') {
         joined.push('/');
@@ -1636,6 +1635,47 @@ fn join_url_template(base_url: &str, url: &str) -> Result<String> {
     }
     joined.push_str(url);
     Ok(joined)
+}
+
+fn read_config_file(path: &Path) -> Result<String> {
+    fs::read_to_string(path).map_err(|e| {
+        Error::config(format!(
+            "Failed to read config file '{}': {e}. \
+             Confirm the path exists and is readable (CLI: --config PATH)",
+            path.display()
+        ))
+    })
+}
+
+fn parse_config_error(format: &str, err: impl std::fmt::Display) -> Error {
+    let msg = err.to_string();
+    match config_parse_hint(&msg) {
+        Some(hint) => Error::config(format!("Failed to parse {format}: {msg}. {hint}")),
+        None => Error::config(format!("Failed to parse {format}: {msg}")),
+    }
+}
+
+fn config_parse_hint(msg: &str) -> Option<&'static str> {
+    let lower = msg.to_lowercase();
+    if lower.contains("invalid type: string") && lower.contains("expected u64") {
+        return Some(
+            "This field is an integer count, not a string. For time values use \
+             duration_seconds: 30 or think_time_ms: 100, not \"30s\"",
+        );
+    }
+    if lower.contains("missing field") {
+        return Some(
+            "Required step fields are name and url; each scenario needs name and a non-empty steps list",
+        );
+    }
+    None
+}
+
+fn invalid_base_url(base_url: &str, detail: impl std::fmt::Display) -> Error {
+    Error::config(format!(
+        "Invalid [global] base_url '{base_url}' ({detail}). \
+         base_url must be an absolute http(s) URL such as https://api.example.com"
+    ))
 }
 
 // Default values for configuration
@@ -1907,7 +1947,11 @@ mod tests {
         "#;
 
         let config = Config::from_toml_str(toml_str).unwrap();
-        assert!(config.build_scenarios().is_err());
+        let err = config.build_scenarios().unwrap_err().to_string();
+        assert!(
+            err.contains("/api/resource") && err.contains("[global] base_url"),
+            "expected relative-URL hint, got {err}"
+        );
     }
 
     #[test]
@@ -2404,5 +2448,79 @@ steps:
         assert_eq!(report.templates, 2);
         assert_eq!(report.extractors, 1);
         assert_eq!(report.branches, 1);
+    }
+
+    #[test]
+    fn test_parse_rejects_duration_string_with_integer_hint() {
+        let err = Config::from_toml_str(
+            r#"
+            [global]
+            duration_seconds = "30s"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("duration_seconds") && err.contains("not a string"),
+            "expected duration integer hint, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_missing_step_name_with_required_fields_hint() {
+        let err = Config::from_toml_str(
+            r#"
+            [scenarios.s]
+            name = "S"
+            steps = ["a"]
+
+            [steps.a]
+            url = "https://example.com/"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("missing field") && err.contains("name and url"),
+            "expected required-fields hint, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_telemetry_exporter_with_supported_values() {
+        let config = Config::from_toml_str(
+            r#"
+            [telemetry]
+            enabled = true
+            exporter = "prometheus"
+
+            [scenarios.s]
+            name = "S"
+            steps = ["a"]
+
+            [steps.a]
+            name = "A"
+            url = "http://example.test/"
+            "#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("prometheus")
+                && err.contains("json, console, noop, none")
+                && err.contains("not implemented"),
+            "expected telemetry allow-list hint, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_toml_missing_file_includes_path() {
+        let path = std::env::temp_dir().join("pummel-missing-config-test.toml");
+        let _ = std::fs::remove_file(&path);
+        let err = Config::from_toml(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(&path.display().to_string()) && err.contains("--config"),
+            "expected path and --config hint, got {err}"
+        );
     }
 }
