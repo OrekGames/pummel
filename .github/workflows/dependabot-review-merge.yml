@@ -1,0 +1,50 @@
+name: Dependabot review and merge
+
+# Runs from the default branch so GITHUB_TOKEN keeps write access.
+# pull_request events opened by Dependabot[bot] only receive a read-only token.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Review and print actions without approving or merging
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: dependabot-review-merge
+  cancel-in-progress: false
+
+jobs:
+  review-and-merge:
+    name: review-and-merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      statuses: read
+      actions: read
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Review Dependabot PRs and merge the next approved one
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DEPENDABOT_QUEUE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          bash -n scripts/dependabot_queue.sh
+          if [ "${DEPENDABOT_QUEUE_DRY_RUN}" = "true" ]; then
+            bash scripts/dependabot_queue.sh run --dry-run
+          else
+            bash scripts/dependabot_queue.sh run
+          fi

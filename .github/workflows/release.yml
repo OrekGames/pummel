@@ -89,7 +89,9 @@ jobs:
       - name: Installer checks
         run: |
           bash -n scripts/install.sh
+          bash -n scripts/dependabot_queue.sh
           bash scripts/tests/installer_harness.sh
+          bash scripts/tests/dependabot_queue_harness.sh
 
   # Mirror ci.yml installer-checks-windows so tagged releases cannot ship a
   # broken install.ps1 / harness that only Linux bash checks would miss.
