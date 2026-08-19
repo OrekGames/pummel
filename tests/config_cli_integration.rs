@@ -588,6 +588,41 @@ fn proof7_json_output_is_clean_parseable_json() {
 }
 
 #[test]
+fn proof7_text_output_includes_status_and_breakdown() {
+    let server = TestServer::start(|_m, _p| Reply::ok("ok"));
+    let cfg = write_config(&single_pass_config(&server.base()));
+
+    let out = Command::new(cli_bin())
+        .arg("--config")
+        .arg(cfg.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "clean run should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Load Test Results: completed"),
+        "status missing from text results: {stdout}"
+    );
+    assert!(
+        stdout.contains("Virtual users:"),
+        "virtual users missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("Scenario s") && stdout.contains("Step a"),
+        "scenario/step breakdown missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("p50") && stdout.contains("p95") && stdout.contains("p99"),
+        "step percentiles missing: {stdout}"
+    );
+}
+
+#[test]
 fn proof7_threshold_breach_exits_nonzero() {
     // Server fails every request -> error_rate 1.0. --max-error-rate 0.0 => breach.
     let server = TestServer::start(|_m, _p| Reply::status(500, "boom"));
