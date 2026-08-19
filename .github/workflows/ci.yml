@@ -160,10 +160,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Syntax-check install.sh
-        run: bash -n scripts/install.sh
+      - name: Syntax-check scripts
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/dependabot_queue.sh
       - name: Run installer harness
         run: bash scripts/tests/installer_harness.sh
+      - name: Run Dependabot queue harness
+        run: bash scripts/tests/dependabot_queue_harness.sh
 
   installer-checks-windows:
     name: installer-checks-windows
