@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crates.io and binary installers are documented as post-release only.
 - CLI/config errors for relative URLs, duration strings, telemetry allow-lists,
   and missing config files now include a fix hint.
+- CLI: default text results now include run status, virtual users, and a
+  per-scenario / per-step latency breakdown (p50/p90/p95/p99). JSON output is
+  unchanged.
 
 ## [0.1.0] - 2026-07-06
 

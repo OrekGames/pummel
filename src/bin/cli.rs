@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -290,18 +291,83 @@ fn print_dry_run_summary(scenarios: &[Scenario]) {
 }
 
 fn print_text_results(results: &TestResults) {
-    println!("\nLoad Test Results:");
-    println!("Total Requests: {}", results.total_requests);
-    println!("Successful Requests: {}", results.successful_requests);
-    println!("Failed Requests: {}", results.failed_requests);
-    println!(
-        "Average Response Time: {:.2}ms",
-        results.avg_response_time_ms
+    print!("{}", format_text_results(results));
+}
+
+fn run_status_label(status: &RunStatus) -> String {
+    match status {
+        RunStatus::Completed => "completed".to_string(),
+        RunStatus::Truncated { reason } => format!("truncated ({reason})"),
+        RunStatus::Failed { reason } => format!("failed ({reason})"),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Human-readable default CLI summary. JSON (`--format json`) remains the
+/// machine-readable dump of the full [`TestResults`] struct.
+fn format_text_results(results: &TestResults) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Load Test Results: {}",
+        run_status_label(&results.status)
     );
-    println!("P90 Response Time: {}ms", results.p90_response_time_ms);
-    println!("Requests Per Second: {:.2}", results.requests_per_second);
-    println!("Error Rate: {:.2}%", results.error_rate * 100.0);
-    println!("Duration: {:.2}s", results.duration_seconds);
+    let _ = writeln!(out, "Virtual users: {}", results.total_virtual_users);
+    let _ = writeln!(out, "Duration: {:.2}s", results.duration_seconds);
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Requests: {} total, {} ok, {} failed ({:.2}% errors)",
+        results.total_requests,
+        results.successful_requests,
+        results.failed_requests,
+        results.error_rate * 100.0
+    );
+    let _ = writeln!(out, "Throughput: {:.2} req/s", results.requests_per_second);
+    let _ = writeln!(
+        out,
+        "Latency: avg {:.2}ms, p90 {}ms",
+        results.avg_response_time_ms, results.p90_response_time_ms
+    );
+
+    if results.scenarios.is_empty() {
+        return out;
+    }
+
+    let mut scenario_ids: Vec<_> = results.scenarios.keys().cloned().collect();
+    scenario_ids.sort();
+    let _ = writeln!(out);
+    for id in scenario_ids {
+        let scenario = &results.scenarios[&id];
+        let _ = writeln!(
+            out,
+            "Scenario {id} ({}): {} user(s), {} req, {} failed, p90 {}ms, {:.2} req/s",
+            scenario.name,
+            scenario.virtual_users,
+            scenario.total_requests,
+            scenario.failed_requests,
+            scenario.p90_response_time_ms,
+            scenario.requests_per_second
+        );
+        let mut step_ids: Vec<_> = scenario.steps.keys().cloned().collect();
+        step_ids.sort();
+        for step_id in step_ids {
+            let step = &scenario.steps[&step_id];
+            let _ = writeln!(
+                out,
+                "  Step {step_id} ({}): {} req, {} failed, avg {:.2}ms, p50 {}ms p90 {}ms p95 {}ms p99 {}ms",
+                step.name,
+                step.total_requests,
+                step.failed_requests,
+                step.avg_response_time_ms,
+                step.p50_response_time_ms,
+                step.p90_response_time_ms,
+                step.p95_response_time_ms,
+                step.p99_response_time_ms
+            );
+        }
+    }
+    out
 }
 
 fn print_json_results(results: &TestResults) -> Result<()> {
@@ -381,5 +447,109 @@ mod tests {
             min_requests: Some(100),
         };
         assert!(evaluate_thresholds(&results, &thresholds).is_empty());
+    }
+
+    fn sample_step(id: &str, name: &str) -> pummel::metrics::StepMetrics {
+        let now = chrono::Utc::now();
+        pummel::metrics::StepMetrics {
+            step_id: id.to_string(),
+            name: name.to_string(),
+            total_requests: 10,
+            successful_requests: 9,
+            failed_requests: 1,
+            min_response_time_ms: 5,
+            max_response_time_ms: 40,
+            avg_response_time_ms: 12.5,
+            p50_response_time_ms: 10,
+            p90_response_time_ms: 20,
+            p95_response_time_ms: 25,
+            p99_response_time_ms: 35,
+            requests_per_second: 10.0,
+            error_rate: 0.1,
+            start_time: now,
+            end_time: now,
+            duration_seconds: 1.0,
+        }
+    }
+
+    fn sample_scenario(
+        id: &str,
+        name: &str,
+        steps: Vec<pummel::metrics::StepMetrics>,
+    ) -> pummel::metrics::ScenarioMetrics {
+        let now = chrono::Utc::now();
+        let mut step_map = std::collections::HashMap::new();
+        for step in steps {
+            step_map.insert(step.step_id.clone(), step);
+        }
+        pummel::metrics::ScenarioMetrics {
+            scenario_id: id.to_string(),
+            name: name.to_string(),
+            steps: step_map,
+            total_requests: 10,
+            successful_requests: 9,
+            failed_requests: 1,
+            avg_response_time_ms: 12.5,
+            p90_response_time_ms: 20,
+            requests_per_second: 10.0,
+            error_rate: 0.1,
+            start_time: now,
+            end_time: now,
+            duration_seconds: 1.0,
+            virtual_users: 3,
+        }
+    }
+
+    #[test]
+    fn text_results_include_status_users_and_step_percentiles() {
+        let mut results = results_with(0.1, 20, 10);
+        results.successful_requests = 9;
+        results.failed_requests = 1;
+        results.avg_response_time_ms = 12.5;
+        results.requests_per_second = 10.0;
+        results.duration_seconds = 1.0;
+        results.total_virtual_users = 3;
+        results.scenarios.insert(
+            "zeta".to_string(),
+            sample_scenario("zeta", "Zeta", vec![sample_step("home", "Home")]),
+        );
+        results.scenarios.insert(
+            "alpha".to_string(),
+            sample_scenario("alpha", "Alpha", vec![sample_step("echo", "Echo")]),
+        );
+
+        let text = format_text_results(&results);
+        assert!(
+            text.starts_with("Load Test Results: completed\n"),
+            "status line missing: {text}"
+        );
+        assert!(text.contains("Virtual users: 3"), "{text}");
+        assert!(
+            text.contains("Requests: 10 total, 9 ok, 1 failed (10.00% errors)"),
+            "{text}"
+        );
+        assert!(text.contains("Latency: avg 12.50ms, p90 20ms"), "{text}");
+        assert!(
+            text.contains("  Step echo (Echo): 10 req, 1 failed, avg 12.50ms, p50 10ms p90 20ms p95 25ms p99 35ms"),
+            "{text}"
+        );
+        let alpha = text.find("Scenario alpha").expect("alpha scenario");
+        let zeta = text.find("Scenario zeta").expect("zeta scenario");
+        assert!(alpha < zeta, "scenarios should be sorted by id: {text}");
+    }
+
+    #[test]
+    fn text_results_include_truncated_reason() {
+        let results = TestResults {
+            status: RunStatus::Truncated {
+                reason: "deadline reached".to_string(),
+            },
+            ..Default::default()
+        };
+        let text = format_text_results(&results);
+        assert!(
+            text.contains("Load Test Results: truncated (deadline reached)"),
+            "{text}"
+        );
     }
 }

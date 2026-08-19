@@ -167,7 +167,24 @@ Options:
 
 Results are written to **stdout** (raw JSON with `--format json`, human-readable text
 otherwise) while all logs go to **stderr**, so `--format json | jq` and `2>/dev/null`
-both work. The process exit code follows a stable contract for CI gating:
+both work. Default text output includes run status, virtual users, aggregate
+request/latency totals, and a per-scenario / per-step breakdown (p50/p90/p95/p99
+on each step). Example:
+
+```text
+Load Test Results: completed
+Virtual users: 1
+Duration: 5.00s
+
+Requests: 42 total, 42 ok, 0 failed (0.00% errors)
+Throughput: 8.40 req/s
+Latency: avg 12.34ms, p90 20ms
+
+Scenario hello (Hello Load Test): 1 user(s), 42 req, 0 failed, p90 20ms, 8.40 req/s
+  Step echo (HTTP Echo): 42 req, 0 failed, avg 12.34ms, p50 10ms p90 20ms p95 22ms p99 30ms
+```
+
+The process exit code follows a stable contract for CI gating:
 
 | Code | Meaning |
 | ---- | ------- |
