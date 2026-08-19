@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-scenario / per-step latency breakdown (p50/p90/p95/p99). JSON output is
   unchanged.
 
+### Fixed
+
+- Bump transitive `h2` to 0.4.17 (`RUSTSEC-2026-0258`, unbounded empty DATA
+  frames).
+
 ## [0.1.0] - 2026-07-06
 
 First substantive release, following a full code-review remediation that turned
