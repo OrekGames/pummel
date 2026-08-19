@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Upgrade transitive `h2` from 0.4.11 to 0.4.16 (`RUSTSEC-2026-0258`).
+
 ### Changed
 
 - **Breaking:** `MetricsCollector::get_step_metrics` now takes
