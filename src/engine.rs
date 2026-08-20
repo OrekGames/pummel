@@ -345,6 +345,38 @@ pub enum VirtualUserStatus {
     Failed(String),
 }
 
+enum TemplateSegment {
+    Literal(String),
+    Expr(String),
+}
+
+fn parse_template(template: &str) -> Result<Vec<TemplateSegment>> {
+    let mut segments = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        if start > 0 {
+            segments.push(TemplateSegment::Literal(rest[..start].to_string()));
+        }
+        let after_start = &rest[start + 2..];
+        let end = after_start
+            .find("}}")
+            .ok_or_else(|| Error::config("Unclosed template expression"))?;
+        let expr = after_start[..end].trim();
+        if expr.is_empty() {
+            return Err(Error::config("Empty template expression"));
+        }
+        segments.push(TemplateSegment::Expr(expr.to_string()));
+        rest = &after_start[end + 2..];
+    }
+    if rest.contains("}}") {
+        return Err(Error::config("Unopened template expression"));
+    }
+    if !rest.is_empty() {
+        segments.push(TemplateSegment::Literal(rest.to_string()));
+    }
+    Ok(segments)
+}
+
 fn value_to_template_string(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
@@ -411,26 +443,34 @@ fn parse_data_expr(expr: &str) -> Result<(&str, &str)> {
     })
 }
 
+thread_local! {
+    // ⚡ Bolt Optimization: Cache parsed template segments to avoid repeated string searches
+    // and allocations in `render_template` across many virtual users.
+    static TEMPLATE_CACHE: RefCell<LruCache<String, Arc<Vec<TemplateSegment>>>> = RefCell::new(
+        LruCache::new(NonZeroUsize::new(1000).unwrap())
+    );
+}
+
 fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result<String> {
-    let mut rendered = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("{{") {
-        rendered.push_str(&rest[..start]);
-        let after_start = &rest[start + 2..];
-        let end = after_start
-            .find("}}")
-            .ok_or_else(|| Error::config("Unclosed template expression"))?;
-        let expr = after_start[..end].trim();
-        if expr.is_empty() {
-            return Err(Error::config("Empty template expression"));
+    let segments = TEMPLATE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(segments) = cache.get(template) {
+            return Ok::<_, Error>(Arc::clone(segments));
         }
-        rendered.push_str(&resolve_template_expr(ctx, step_id, expr)?);
-        rest = &after_start[end + 2..];
+        let segments = Arc::new(parse_template(template)?);
+        cache.put(template.to_string(), Arc::clone(&segments));
+        Ok(segments)
+    })?;
+
+    let mut rendered = String::with_capacity(template.len());
+    for segment in segments.iter() {
+        match segment {
+            TemplateSegment::Literal(s) => rendered.push_str(s),
+            TemplateSegment::Expr(expr) => {
+                rendered.push_str(&resolve_template_expr(ctx, step_id, expr)?)
+            }
+        }
     }
-    if rest.contains("}}") {
-        return Err(Error::config("Unopened template expression"));
-    }
-    rendered.push_str(rest);
     Ok(rendered)
 }
 
