@@ -630,7 +630,7 @@ fn regex_capture(regex: &regex::Regex, haystack: &str) -> Option<String> {
 thread_local! {
     // ⚡ Bolt Optimization: Use a thread-local cache to eliminate lock contention on the hot path
     // when dynamically compiling or matching regexes in extractors across many virtual users.
-    static EXTRACTOR_REGEX_CACHE: std::cell::RefCell<LruCache<String, Arc<regex::Regex>>> =
+    static EXTRACTOR_REGEX_CACHE: std::cell::RefCell<LruCache<String, std::rc::Rc<regex::Regex>>> =
         std::cell::RefCell::new(LruCache::new(NonZeroUsize::new(1024).unwrap()));
 }
 
@@ -646,7 +646,7 @@ fn run_extractor_regex(extractor: &Extractor, haystack: &str) -> Result<Option<S
         return Ok(regex_capture(&re, haystack));
     }
 
-    let re = Arc::new(
+    let re = std::rc::Rc::new(
         regex::Regex::new(&extractor.selector)
             .map_err(|e| Error::validation(format!("invalid extractor regex: {e}")))?,
     );

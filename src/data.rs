@@ -537,20 +537,20 @@ pub fn extract_relative_json_path(value: &Value, path: &str) -> Option<Value> {
     extract_json_path_tokens(value, &tokens)
 }
 
-fn cached_relative_json_path_tokens(path: &str) -> Option<Arc<Vec<JsonPathToken>>> {
+fn cached_relative_json_path_tokens(path: &str) -> Option<std::rc::Rc<Vec<JsonPathToken>>> {
     thread_local! {
-        static CACHE: RefCell<lru::LruCache<String, Arc<Vec<JsonPathToken>>>> = RefCell::new(
+        static CACHE: RefCell<lru::LruCache<String, std::rc::Rc<Vec<JsonPathToken>>>> = RefCell::new(
             lru::LruCache::new(NonZeroUsize::new(1000).unwrap())
         );
     }
     CACHE.with(|cache| {
         if let Some(existing) = cache.borrow_mut().get(path) {
-            return Some(Arc::clone(existing));
+            return Some(std::rc::Rc::clone(existing));
         }
-        let tokens = Arc::new(parse_relative_json_path(path).ok()?);
+        let tokens = std::rc::Rc::new(parse_relative_json_path(path).ok()?);
         cache
             .borrow_mut()
-            .put(path.to_string(), Arc::clone(&tokens));
+            .put(path.to_string(), std::rc::Rc::clone(&tokens));
         Some(tokens)
     })
 }
