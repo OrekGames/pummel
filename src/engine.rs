@@ -418,6 +418,19 @@ pub enum TemplateSegment {
     Expression(String),
 }
 
+/// A parsed template segment, optimized for runtime evaluation.
+#[derive(Clone)]
+enum FastTemplateSegment {
+    Literal(String),
+    VuId,
+    ScenarioId,
+    StepId,
+    Iteration,
+    Uuid,
+    RandomU64,
+    Expression(String),
+}
+
 #[doc(hidden)]
 pub fn parse_template(template: &str) -> Result<Vec<TemplateSegment>> {
     let mut parsed = Vec::new();
@@ -449,29 +462,58 @@ pub fn parse_template(template: &str) -> Result<Vec<TemplateSegment>> {
 thread_local! {
     // ⚡ Bolt Optimization: Use a thread-local cache to eliminate lock contention on the hot path
     // and avoid repeated string parsing for identical template strings.
-    static TEMPLATE_CACHE: std::cell::RefCell<LruCache<String, std::rc::Rc<Vec<TemplateSegment>>>> =
+    static TEMPLATE_CACHE: std::cell::RefCell<LruCache<String, std::rc::Rc<Vec<FastTemplateSegment>>>> =
         std::cell::RefCell::new(LruCache::new(std::num::NonZeroUsize::new(1024).unwrap()));
 }
 
 #[doc(hidden)]
 pub fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result<String> {
-    let segments = TEMPLATE_CACHE.with(|cache| -> Result<std::rc::Rc<Vec<TemplateSegment>>> {
-        let mut cache = cache.borrow_mut();
-        if let Some(segments) = cache.get(template) {
-            return Ok(std::rc::Rc::clone(segments));
-        }
+    let segments =
+        TEMPLATE_CACHE.with(|cache| -> Result<std::rc::Rc<Vec<FastTemplateSegment>>> {
+            let mut cache = cache.borrow_mut();
+            if let Some(segments) = cache.get(template) {
+                return Ok(std::rc::Rc::clone(segments));
+            }
 
-        let parsed = parse_template(template)?;
-        let segments = std::rc::Rc::new(parsed);
-        cache.put(template.to_string(), std::rc::Rc::clone(&segments));
-        Ok(segments)
-    })?;
+            let parsed = parse_template(template)?;
+            let mut fast_segments = Vec::with_capacity(parsed.len());
+            for segment in parsed {
+                match segment {
+                    TemplateSegment::Literal(text) => {
+                        fast_segments.push(FastTemplateSegment::Literal(text))
+                    }
+                    TemplateSegment::Expression(expr) => {
+                        let fast_segment = match expr.as_str() {
+                            "vu.id" => FastTemplateSegment::VuId,
+                            "scenario.id" => FastTemplateSegment::ScenarioId,
+                            "step.id" => FastTemplateSegment::StepId,
+                            "iteration" => FastTemplateSegment::Iteration,
+                            "uuid" => FastTemplateSegment::Uuid,
+                            "random.u64" => FastTemplateSegment::RandomU64,
+                            _ => FastTemplateSegment::Expression(expr),
+                        };
+                        fast_segments.push(fast_segment);
+                    }
+                }
+            }
+            let segments = std::rc::Rc::new(fast_segments);
+            cache.put(template.to_string(), std::rc::Rc::clone(&segments));
+            Ok(segments)
+        })?;
 
     let mut rendered = String::with_capacity(template.len());
     for segment in segments.iter() {
         match segment {
-            TemplateSegment::Literal(text) => rendered.push_str(text),
-            TemplateSegment::Expression(expr) => {
+            FastTemplateSegment::Literal(text) => rendered.push_str(text),
+            FastTemplateSegment::VuId => rendered.push_str(&ctx.id.to_string()),
+            FastTemplateSegment::ScenarioId => rendered.push_str(&ctx.scenario_id),
+            FastTemplateSegment::StepId => rendered.push_str(step_id),
+            FastTemplateSegment::Iteration => rendered.push_str(&ctx.iteration.to_string()),
+            FastTemplateSegment::Uuid => rendered.push_str(&Uuid::new_v4().to_string()),
+            FastTemplateSegment::RandomU64 => {
+                rendered.push_str(&rand::rng().random::<u64>().to_string())
+            }
+            FastTemplateSegment::Expression(expr) => {
                 rendered.push_str(&resolve_template_expr(ctx, step_id, expr)?);
             }
         }
