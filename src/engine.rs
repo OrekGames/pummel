@@ -411,9 +411,39 @@ fn parse_data_expr(expr: &str) -> Result<(&str, &str)> {
     })
 }
 
-enum TemplateSegment {
+#[derive(Clone)]
+#[doc(hidden)]
+pub enum TemplateSegment {
     Literal(String),
     Expression(String),
+}
+
+#[doc(hidden)]
+pub fn parse_template(template: &str) -> Result<Vec<TemplateSegment>> {
+    let mut parsed = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        if start > 0 {
+            parsed.push(TemplateSegment::Literal(rest[..start].to_string()));
+        }
+        let after_start = &rest[start + 2..];
+        let end = after_start
+            .find("}}")
+            .ok_or_else(|| Error::config("Unclosed template expression"))?;
+        let expr = after_start[..end].trim();
+        if expr.is_empty() {
+            return Err(Error::config("Empty template expression"));
+        }
+        parsed.push(TemplateSegment::Expression(expr.to_string()));
+        rest = &after_start[end + 2..];
+    }
+    if rest.contains("}}") {
+        return Err(Error::config("Unopened template expression"));
+    }
+    if !rest.is_empty() {
+        parsed.push(TemplateSegment::Literal(rest.to_string()));
+    }
+    Ok(parsed)
 }
 
 thread_local! {
@@ -423,37 +453,15 @@ thread_local! {
         std::cell::RefCell::new(LruCache::new(std::num::NonZeroUsize::new(1024).unwrap()));
 }
 
-fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result<String> {
-    let segments = TEMPLATE_CACHE.with(|cache| {
+#[doc(hidden)]
+pub fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result<String> {
+    let segments = TEMPLATE_CACHE.with(|cache| -> Result<std::rc::Rc<Vec<TemplateSegment>>> {
         let mut cache = cache.borrow_mut();
         if let Some(segments) = cache.get(template) {
             return Ok(std::rc::Rc::clone(segments));
         }
 
-        let mut parsed = Vec::new();
-        let mut rest = template;
-        while let Some(start) = rest.find("{{") {
-            if start > 0 {
-                parsed.push(TemplateSegment::Literal(rest[..start].to_string()));
-            }
-            let after_start = &rest[start + 2..];
-            let end = after_start
-                .find("}}")
-                .ok_or_else(|| Error::config("Unclosed template expression"))?;
-            let expr = after_start[..end].trim();
-            if expr.is_empty() {
-                return Err(Error::config("Empty template expression"));
-            }
-            parsed.push(TemplateSegment::Expression(expr.to_string()));
-            rest = &after_start[end + 2..];
-        }
-        if rest.contains("}}") {
-            return Err(Error::config("Unopened template expression"));
-        }
-        if !rest.is_empty() {
-            parsed.push(TemplateSegment::Literal(rest.to_string()));
-        }
-
+        let parsed = parse_template(template)?;
         let segments = std::rc::Rc::new(parsed);
         cache.put(template.to_string(), std::rc::Rc::clone(&segments));
         Ok(segments)
