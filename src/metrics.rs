@@ -1329,6 +1329,87 @@ mod tests {
         assert!(!NoopMetricsCollector::new().records_requests());
     }
 
+    /// Same-key concurrent records must not lose updates (atomics + get-then-insert).
+    #[tokio::test]
+    async fn test_concurrent_same_key_record_no_lost_updates() {
+        const TASKS: usize = 32;
+        const PER_TASK: u64 = 50;
+        let expected = (TASKS as u64) * PER_TASK;
+        let elapsed = Duration::from_millis(10);
+        let request = Request::get("https://example.com").build().unwrap();
+        let response = Response::new(
+            StatusCode::OK,
+            reqwest::header::HeaderMap::new(),
+            crate::http::Body::Empty,
+            elapsed,
+        );
+
+        for use_summary in [true, false] {
+            let collector = Arc::new(InMemoryMetricsCollector::new());
+            let barrier = Arc::new(tokio::sync::Barrier::new(TASKS));
+            let handles: Vec<_> = (0..TASKS)
+                .map(|task| {
+                    let collector = Arc::clone(&collector);
+                    let barrier = Arc::clone(&barrier);
+                    let request = request.clone();
+                    let response = response.clone();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        for n in 0..PER_TASK {
+                            if use_summary {
+                                collector
+                                    .record_attempt_summary(AttemptSummary {
+                                        scenario_id: "scenario1",
+                                        step_id: "step1",
+                                        step_name: "Step 1",
+                                        scenario_name: "Scenario 1",
+                                        virtual_user_id: task as u32,
+                                        success: true,
+                                        elapsed,
+                                    })
+                                    .await
+                                    .unwrap();
+                            } else {
+                                collector
+                                    .record_request(RequestMetrics::new(RequestMetricsParams {
+                                        id: format!("req-{task}-{n}"),
+                                        step_id: "step1".to_string(),
+                                        step_name: "Step 1".to_string(),
+                                        scenario_id: "scenario1".to_string(),
+                                        scenario_name: "Scenario 1".to_string(),
+                                        virtual_user_id: task as u32,
+                                        request: &request,
+                                        response: Some(&response),
+                                        error: None,
+                                        elapsed,
+                                    }))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            let step = collector
+                .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                step.total_requests, expected,
+                "lost updates on use_summary={use_summary}"
+            );
+            assert_eq!(step.successful_requests, expected);
+            assert_eq!(step.failed_requests, 0);
+            assert_eq!(step.avg_response_time_ms, 10.0);
+        }
+    }
+
     #[tokio::test]
     async fn test_record_and_retrieve_metrics() {
         let collector = InMemoryMetricsCollector::new();
