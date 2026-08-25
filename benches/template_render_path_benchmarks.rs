@@ -86,8 +86,12 @@ fn bench_template_render(c: &mut Criterion) {
 
     group.bench_function("production_render_cached", |b| {
         b.iter(|| {
-            let rendered =
-                render_template(black_box(&ctx), black_box(step_id), black_box(template_single)).unwrap();
+            let rendered = render_template(
+                black_box(&ctx),
+                black_box(step_id),
+                black_box(template_single),
+            )
+            .unwrap();
             black_box(rendered)
         });
     });
@@ -97,8 +101,12 @@ fn bench_template_render(c: &mut Criterion) {
 
     group.bench_function("production_render_cached_multi", |b| {
         b.iter(|| {
-            let rendered =
-                render_template(black_box(&ctx), black_box(step_id), black_box(template_multi)).unwrap();
+            let rendered = render_template(
+                black_box(&ctx),
+                black_box(step_id),
+                black_box(template_multi),
+            )
+            .unwrap();
             black_box(rendered)
         });
     });
