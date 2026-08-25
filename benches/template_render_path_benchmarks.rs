@@ -78,17 +78,27 @@ fn bench_template_render(c: &mut Criterion) {
     let mut group = c.benchmark_group("template_render");
     group.throughput(Throughput::Elements(1));
 
-    let template = "Hello {{vu.id}}, this is {{scenario.id}} at {{step.id}}! Here is some extra text to make it longer.";
     let ctx = VuContext::new(1, "my_scenario".to_string());
     let step_id = "my_step";
 
-    // Call once to ensure it's in the thread-local cache before benching the fast path.
-    let _ = render_template(&ctx, step_id, template).unwrap();
+    let template_single = "Hello {{vu.id}}, this is {{scenario.id}} at {{step.id}}! Here is some extra text to make it longer.";
+    let _ = render_template(&ctx, step_id, template_single).unwrap();
 
     group.bench_function("production_render_cached", |b| {
         b.iter(|| {
             let rendered =
-                render_template(black_box(&ctx), black_box(step_id), black_box(template)).unwrap();
+                render_template(black_box(&ctx), black_box(step_id), black_box(template_single)).unwrap();
+            black_box(rendered)
+        });
+    });
+
+    let template_multi = "{{vu.id}}/{{scenario.id}}/{{step.id}}";
+    let _ = render_template(&ctx, step_id, template_multi).unwrap();
+
+    group.bench_function("production_render_cached_multi", |b| {
+        b.iter(|| {
+            let rendered =
+                render_template(black_box(&ctx), black_box(step_id), black_box(template_multi)).unwrap();
             black_box(rendered)
         });
     });
