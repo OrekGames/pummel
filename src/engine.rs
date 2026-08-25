@@ -533,17 +533,13 @@ fn branch_matches(
                             return Ok(regex.is_match(&haystack));
                         }
 
-                        match regex::Regex::new(pattern) {
-                            Ok(regex) => {
-                                let is_match = regex.is_match(&haystack);
-                                cache.put(pattern.clone(), regex);
-                                Ok(is_match)
-                            }
-                            // Fail closed: invalid regex must not silently skip.
-                            Err(e) => Err(Error::validation(format!(
-                                "invalid branch regex '{pattern}': {e}"
-                            ))),
-                        }
+                        let regex = regex::Regex::new(pattern).map_err(|e| {
+                            Error::validation(format!("invalid branch regex '{pattern}': {e}"))
+                        })?;
+
+                        let is_match = regex.is_match(&haystack);
+                        cache.put(pattern.clone(), regex);
+                        Ok(is_match)
                     })
                 } else {
                     Err(Error::validation(
