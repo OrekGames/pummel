@@ -415,13 +415,6 @@ fn parse_data_expr(expr: &str) -> Result<(&str, &str)> {
 #[doc(hidden)]
 pub enum TemplateSegment {
     Literal(String),
-    Expression(String),
-}
-
-/// A parsed template segment, optimized for runtime evaluation.
-#[derive(Clone)]
-enum FastTemplateSegment {
-    Literal(String),
     VuId,
     ScenarioId,
     StepId,
@@ -447,7 +440,17 @@ pub fn parse_template(template: &str) -> Result<Vec<TemplateSegment>> {
         if expr.is_empty() {
             return Err(Error::config("Empty template expression"));
         }
-        parsed.push(TemplateSegment::Expression(expr.to_string()));
+
+        let segment = match expr {
+            "vu.id" => TemplateSegment::VuId,
+            "scenario.id" => TemplateSegment::ScenarioId,
+            "step.id" => TemplateSegment::StepId,
+            "iteration" => TemplateSegment::Iteration,
+            "uuid" => TemplateSegment::Uuid,
+            "random.u64" => TemplateSegment::RandomU64,
+            _ => TemplateSegment::Expression(expr.to_string()),
+        };
+        parsed.push(segment);
         rest = &after_start[end + 2..];
     }
     if rest.contains("}}") {
@@ -462,58 +465,37 @@ pub fn parse_template(template: &str) -> Result<Vec<TemplateSegment>> {
 thread_local! {
     // ⚡ Bolt Optimization: Use a thread-local cache to eliminate lock contention on the hot path
     // and avoid repeated string parsing for identical template strings.
-    static TEMPLATE_CACHE: std::cell::RefCell<LruCache<String, std::rc::Rc<Vec<FastTemplateSegment>>>> =
+    static TEMPLATE_CACHE: std::cell::RefCell<LruCache<String, std::rc::Rc<Vec<TemplateSegment>>>> =
         std::cell::RefCell::new(LruCache::new(std::num::NonZeroUsize::new(1024).unwrap()));
 }
 
 #[doc(hidden)]
 pub fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result<String> {
-    let segments =
-        TEMPLATE_CACHE.with(|cache| -> Result<std::rc::Rc<Vec<FastTemplateSegment>>> {
-            let mut cache = cache.borrow_mut();
-            if let Some(segments) = cache.get(template) {
-                return Ok(std::rc::Rc::clone(segments));
-            }
+    let segments = TEMPLATE_CACHE.with(|cache| -> Result<std::rc::Rc<Vec<TemplateSegment>>> {
+        let mut cache = cache.borrow_mut();
+        if let Some(segments) = cache.get(template) {
+            return Ok(std::rc::Rc::clone(segments));
+        }
 
-            let parsed = parse_template(template)?;
-            let mut fast_segments = Vec::with_capacity(parsed.len());
-            for segment in parsed {
-                match segment {
-                    TemplateSegment::Literal(text) => {
-                        fast_segments.push(FastTemplateSegment::Literal(text))
-                    }
-                    TemplateSegment::Expression(expr) => {
-                        let fast_segment = match expr.as_str() {
-                            "vu.id" => FastTemplateSegment::VuId,
-                            "scenario.id" => FastTemplateSegment::ScenarioId,
-                            "step.id" => FastTemplateSegment::StepId,
-                            "iteration" => FastTemplateSegment::Iteration,
-                            "uuid" => FastTemplateSegment::Uuid,
-                            "random.u64" => FastTemplateSegment::RandomU64,
-                            _ => FastTemplateSegment::Expression(expr),
-                        };
-                        fast_segments.push(fast_segment);
-                    }
-                }
-            }
-            let segments = std::rc::Rc::new(fast_segments);
-            cache.put(template.to_string(), std::rc::Rc::clone(&segments));
-            Ok(segments)
-        })?;
+        let parsed = parse_template(template)?;
+        let segments = std::rc::Rc::new(parsed);
+        cache.put(template.to_string(), std::rc::Rc::clone(&segments));
+        Ok(segments)
+    })?;
 
     let mut rendered = String::with_capacity(template.len());
     for segment in segments.iter() {
         match segment {
-            FastTemplateSegment::Literal(text) => rendered.push_str(text),
-            FastTemplateSegment::VuId => rendered.push_str(&ctx.id.to_string()),
-            FastTemplateSegment::ScenarioId => rendered.push_str(&ctx.scenario_id),
-            FastTemplateSegment::StepId => rendered.push_str(step_id),
-            FastTemplateSegment::Iteration => rendered.push_str(&ctx.iteration.to_string()),
-            FastTemplateSegment::Uuid => rendered.push_str(&Uuid::new_v4().to_string()),
-            FastTemplateSegment::RandomU64 => {
+            TemplateSegment::Literal(text) => rendered.push_str(text),
+            TemplateSegment::VuId => rendered.push_str(&ctx.id.to_string()),
+            TemplateSegment::ScenarioId => rendered.push_str(&ctx.scenario_id),
+            TemplateSegment::StepId => rendered.push_str(step_id),
+            TemplateSegment::Iteration => rendered.push_str(&ctx.iteration.to_string()),
+            TemplateSegment::Uuid => rendered.push_str(&Uuid::new_v4().to_string()),
+            TemplateSegment::RandomU64 => {
                 rendered.push_str(&rand::rng().random::<u64>().to_string())
             }
-            FastTemplateSegment::Expression(expr) => {
+            TemplateSegment::Expression(expr) => {
                 rendered.push_str(&resolve_template_expr(ctx, step_id, expr)?);
             }
         }
