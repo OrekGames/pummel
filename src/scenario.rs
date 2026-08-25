@@ -1073,24 +1073,12 @@ impl Scenario {
         for step in self.steps.values() {
             if let Some(branch) = &step.branch
                 && branch.operator == BranchOperator::MatchesRegex
+                && branch.compiled_regex.is_none()
             {
-                match &branch.value {
-                    Some(pattern) if branch.compiled_regex.is_none() => {
-                        if let Err(e) = regex::Regex::new(pattern) {
-                            return Err(Error::scenario(format!(
-                                "Step '{}' has invalid MatchesRegex pattern: {e}",
-                                step.id
-                            )));
-                        }
-                    }
-                    None => {
-                        return Err(Error::scenario(format!(
-                            "Step '{}' MatchesRegex branch requires a pattern",
-                            step.id
-                        )));
-                    }
-                    _ => {}
-                }
+                return Err(Error::scenario(format!(
+                    "Step '{}' MatchesRegex branch missing compiled_regex",
+                    step.id
+                )));
             }
         }
 

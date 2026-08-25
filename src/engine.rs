@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::num::NonZeroUsize;
@@ -556,31 +555,6 @@ fn branch_matches(
                 let haystack = value_to_template_string(&value);
                 if let Some(regex) = branch.compiled_regex.as_ref() {
                     Ok(regex.is_match(&haystack))
-                } else if let Some(pattern) = &branch.value {
-                    thread_local! {
-                        static REGEX_CACHE: RefCell<LruCache<String, regex::Regex>> = RefCell::new(
-                            LruCache::new(NonZeroUsize::new(1000).unwrap())
-                        );
-                    }
-
-                    REGEX_CACHE.with(|cache| {
-                        let mut cache = cache.borrow_mut();
-                        if let Some(regex) = cache.get(pattern) {
-                            return Ok(regex.is_match(&haystack));
-                        }
-
-                        match regex::Regex::new(pattern) {
-                            Ok(regex) => {
-                                let is_match = regex.is_match(&haystack);
-                                cache.put(pattern.clone(), regex);
-                                Ok(is_match)
-                            }
-                            // Fail closed: invalid regex must not silently skip.
-                            Err(e) => Err(Error::validation(format!(
-                                "invalid branch regex '{pattern}': {e}"
-                            ))),
-                        }
-                    })
                 } else {
                     Err(Error::validation(
                         "MatchesRegex branch requires a pattern".to_string(),
