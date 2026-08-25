@@ -411,11 +411,21 @@ fn parse_data_expr(expr: &str) -> Result<(&str, &str)> {
     })
 }
 
-fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result<String> {
-    let mut rendered = String::with_capacity(template.len());
+#[derive(Clone)]
+#[doc(hidden)]
+pub enum TemplateSegment {
+    Literal(String),
+    Expression(String),
+}
+
+#[doc(hidden)]
+pub fn parse_template(template: &str) -> Result<Vec<TemplateSegment>> {
+    let mut parsed = Vec::new();
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
-        rendered.push_str(&rest[..start]);
+        if start > 0 {
+            parsed.push(TemplateSegment::Literal(rest[..start].to_string()));
+        }
         let after_start = &rest[start + 2..];
         let end = after_start
             .find("}}")
@@ -424,13 +434,48 @@ fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result<Str
         if expr.is_empty() {
             return Err(Error::config("Empty template expression"));
         }
-        rendered.push_str(&resolve_template_expr(ctx, step_id, expr)?);
+        parsed.push(TemplateSegment::Expression(expr.to_string()));
         rest = &after_start[end + 2..];
     }
     if rest.contains("}}") {
         return Err(Error::config("Unopened template expression"));
     }
-    rendered.push_str(rest);
+    if !rest.is_empty() {
+        parsed.push(TemplateSegment::Literal(rest.to_string()));
+    }
+    Ok(parsed)
+}
+
+thread_local! {
+    // ⚡ Bolt Optimization: Use a thread-local cache to eliminate lock contention on the hot path
+    // and avoid repeated string parsing for identical template strings.
+    static TEMPLATE_CACHE: std::cell::RefCell<LruCache<String, std::rc::Rc<Vec<TemplateSegment>>>> =
+        std::cell::RefCell::new(LruCache::new(std::num::NonZeroUsize::new(1024).unwrap()));
+}
+
+#[doc(hidden)]
+pub fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result<String> {
+    let segments = TEMPLATE_CACHE.with(|cache| -> Result<std::rc::Rc<Vec<TemplateSegment>>> {
+        let mut cache = cache.borrow_mut();
+        if let Some(segments) = cache.get(template) {
+            return Ok(std::rc::Rc::clone(segments));
+        }
+
+        let parsed = parse_template(template)?;
+        let segments = std::rc::Rc::new(parsed);
+        cache.put(template.to_string(), std::rc::Rc::clone(&segments));
+        Ok(segments)
+    })?;
+
+    let mut rendered = String::with_capacity(template.len());
+    for segment in segments.iter() {
+        match segment {
+            TemplateSegment::Literal(text) => rendered.push_str(text),
+            TemplateSegment::Expression(expr) => {
+                rendered.push_str(&resolve_template_expr(ctx, step_id, expr)?);
+            }
+        }
+    }
     Ok(rendered)
 }
 
