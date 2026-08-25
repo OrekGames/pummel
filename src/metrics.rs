@@ -670,7 +670,12 @@ impl StepAggregate {
             .fetch_min(started_ms, Ordering::Relaxed);
         self.last_completed_ts_ms
             .fetch_max(completed_ms, Ordering::Relaxed);
-        self.vu_ids.insert(vu_id);
+        // Common case: the VU already recorded against this step. `contains` takes
+        // a shared shard lock; `insert` is exclusive. Skip the exclusive path once
+        // the id is known (distinct-VU count is unchanged either way).
+        if !self.vu_ids.contains(&vu_id) {
+            self.vu_ids.insert(vu_id);
+        }
     }
 }
 
@@ -678,6 +683,75 @@ impl StepAggregate {
 /// for the sentinel values used before any request is recorded.
 fn ts_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate map key (owned + borrowed lookup)
+// ---------------------------------------------------------------------------
+
+/// Owned (scenario, step) map key.
+#[derive(Clone, Debug, Eq)]
+struct AggregateKey {
+    scenario_id: ScenarioId,
+    step_id: StepId,
+}
+
+impl PartialEq for AggregateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.scenario_id == other.scenario_id && self.step_id == other.step_id
+    }
+}
+
+impl std::hash::Hash for AggregateKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.scenario_id.hash(state);
+        self.step_id.hash(state);
+    }
+}
+
+/// Borrowed view of an [`AggregateKey`] for zero-alloc DashMap lookups.
+trait AggregateKeyView {
+    fn scenario_id(&self) -> &str;
+    fn step_id(&self) -> &str;
+}
+
+impl AggregateKeyView for AggregateKey {
+    fn scenario_id(&self) -> &str {
+        &self.scenario_id
+    }
+    fn step_id(&self) -> &str {
+        &self.step_id
+    }
+}
+
+impl AggregateKeyView for (&str, &str) {
+    fn scenario_id(&self) -> &str {
+        self.0
+    }
+    fn step_id(&self) -> &str {
+        self.1
+    }
+}
+
+impl std::hash::Hash for dyn AggregateKeyView + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.scenario_id().hash(state);
+        self.step_id().hash(state);
+    }
+}
+
+impl PartialEq for dyn AggregateKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.scenario_id() == other.scenario_id() && self.step_id() == other.step_id()
+    }
+}
+
+impl Eq for dyn AggregateKeyView + '_ {}
+
+impl<'a> std::borrow::Borrow<dyn AggregateKeyView + 'a> for AggregateKey {
+    fn borrow(&self) -> &(dyn AggregateKeyView + 'a) {
+        self
+    }
 }
 
 /// In-memory streaming metrics collector.
@@ -688,11 +762,11 @@ fn ts_to_datetime(ms: i64) -> DateTime<Utc> {
 /// O(steps × buckets) and never rescan a request log.
 #[derive(Clone)]
 pub struct InMemoryMetricsCollector {
-    /// Running aggregates nested by scenario then step. Nested maps let the hot
-    /// path look up with borrowed `&str` keys (no per-request `String` allocs)
-    /// and take shared shard locks via `get` before falling back to `entry`.
-    /// Wrapped in `Arc` so all clones of the collector share the same data.
-    scenarios: Arc<DashMap<ScenarioId, DashMap<StepId, Arc<StepAggregate>>>>,
+    /// Running aggregates keyed by (scenario id, step id). Wrapped in `Arc` so
+    /// all clones of the collector share the same data. Lookups use borrowed
+    /// `&str` pairs via [`AggregateKeyView`] so the hot path needs no per-request
+    /// `String` allocations; `get` (shared lock) is preferred over `entry`.
+    steps: Arc<DashMap<AggregateKey, Arc<StepAggregate>>>,
 }
 
 /// Parameters for recording an attempt into the streaming aggregate.
@@ -715,31 +789,25 @@ impl InMemoryMetricsCollector {
     /// task, so it can be constructed outside a tokio runtime.
     pub fn new() -> Self {
         Self {
-            scenarios: Arc::new(DashMap::new()),
+            steps: Arc::new(DashMap::new()),
         }
     }
 
     /// Resolve the per-(scenario, step) aggregate for a record attempt.
     ///
-    /// Common case (key already present): shared-lock `get` with borrowed `&str`
-    /// keys, then `Arc` clone — no `String` allocation and no exclusive shard
-    /// lock. Cold path allocates and uses `entry` only when inserting.
+    /// Common case (key already present): one shared-lock `get` with borrowed
+    /// `&str` keys, then `Arc` clone — no `String` allocation and no exclusive
+    /// shard lock. Cold path allocates and uses `entry` only when inserting.
     fn get_or_create_aggregate(&self, scenario_id: &str, step_id: &str) -> Arc<StepAggregate> {
-        if let Some(steps) = self.scenarios.get(scenario_id) {
-            if let Some(existing) = steps.get(step_id) {
-                return existing.clone();
-            }
-            return steps
-                .entry(step_id.to_owned())
-                .or_insert_with(|| Arc::new(StepAggregate::new()))
-                .clone();
+        let borrowed: &(dyn AggregateKeyView + '_) = &(scenario_id, step_id);
+        if let Some(existing) = self.steps.get(borrowed) {
+            return existing.clone();
         }
-        let steps = self
-            .scenarios
-            .entry(scenario_id.to_owned())
-            .or_insert_with(DashMap::new);
-        steps
-            .entry(step_id.to_owned())
+        self.steps
+            .entry(AggregateKey {
+                scenario_id: scenario_id.to_owned(),
+                step_id: step_id.to_owned(),
+            })
             .or_insert_with(|| Arc::new(StepAggregate::new()))
             .clone()
     }
@@ -907,13 +975,12 @@ impl InMemoryMetricsCollector {
     fn snapshot_by_scenario(&self) -> HashMap<ScenarioId, Vec<(StepId, Arc<StepAggregate>)>> {
         let mut by_scenario: HashMap<ScenarioId, Vec<(StepId, Arc<StepAggregate>)>> =
             HashMap::new();
-        for scenario_entry in self.scenarios.iter() {
-            let steps: Vec<(StepId, Arc<StepAggregate>)> = scenario_entry
-                .value()
-                .iter()
-                .map(|step_entry| (step_entry.key().clone(), step_entry.value().clone()))
-                .collect();
-            by_scenario.insert(scenario_entry.key().clone(), steps);
+        for entry in self.steps.iter() {
+            let key = entry.key();
+            by_scenario
+                .entry(key.scenario_id.clone())
+                .or_default()
+                .push((key.step_id.clone(), entry.value().clone()));
         }
         by_scenario
     }
@@ -975,24 +1042,23 @@ impl MetricsCollector for InMemoryMetricsCollector {
         scenario_id: &ScenarioId,
         step_id: &StepId,
     ) -> Result<Option<StepMetrics>> {
-        Ok(self.scenarios.get(scenario_id).and_then(|steps| {
-            steps
-                .get(step_id)
-                .map(|entry| Self::build_step_metrics(step_id, entry.value()))
-        }))
+        let borrowed: &(dyn AggregateKeyView + '_) = &(scenario_id.as_str(), step_id.as_str());
+        Ok(self
+            .steps
+            .get(borrowed)
+            .map(|entry| Self::build_step_metrics(step_id, entry.value())))
     }
 
     async fn get_scenario_metrics(
         &self,
         scenario_id: &ScenarioId,
     ) -> Result<Option<ScenarioMetrics>> {
-        let entries: Vec<(StepId, Arc<StepAggregate>)> = match self.scenarios.get(scenario_id) {
-            Some(steps) => steps
-                .iter()
-                .map(|e| (e.key().clone(), e.value().clone()))
-                .collect(),
-            None => return Ok(None),
-        };
+        let entries: Vec<(StepId, Arc<StepAggregate>)> = self
+            .steps
+            .iter()
+            .filter(|e| e.key().scenario_id == *scenario_id)
+            .map(|e| (e.key().step_id.clone(), e.value().clone()))
+            .collect();
         Ok(Self::build_scenario_metrics(scenario_id, &entries))
     }
 
@@ -1070,7 +1136,7 @@ impl MetricsCollector for InMemoryMetricsCollector {
     }
 
     async fn reset(&self) -> Result<()> {
-        self.scenarios.clear();
+        self.steps.clear();
         Ok(())
     }
 
