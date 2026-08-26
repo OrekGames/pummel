@@ -828,9 +828,12 @@ impl BranchConfig {
                 let value = self.value.as_ref().ok_or_else(|| {
                     Error::config("branch condition 'matches_regex' requires a value")
                 })?;
-                regex::Regex::new(value)
-                    .map_err(|e| Error::config(format!("invalid branch regex: {e}")))?;
-                Ok(BranchCondition::matches_regex(&self.variable, value))
+                let condition =
+                    BranchCondition::try_matches_regex(&self.variable, value).map_err(|_| {
+                        let e = regex::Regex::new(value).unwrap_err();
+                        Error::config(format!("invalid branch regex: {e}"))
+                    })?;
+                Ok(condition)
             }
         }
     }
