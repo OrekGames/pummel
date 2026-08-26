@@ -119,7 +119,7 @@ impl Config {
 
     /// Load configuration from a YAML string
     pub fn from_yaml_str(content: &str) -> Result<Self> {
-        serde_yaml::from_str(content).map_err(|e| parse_config_error("YAML", e))
+        serde_yaml::from_str(content).map_err(parse_yaml_error)
     }
 
     /// Save configuration to a YAML file
@@ -167,9 +167,7 @@ impl Config {
             ));
         }
         if self.global.virtual_users == 0 {
-            return Err(Error::config(
-                "global.virtual_users is 0; it must be a positive integer",
-            ));
+            return Err(zero_virtual_users_error("global.virtual_users"));
         }
 
         validate_headers("global.headers", &self.global.headers)?;
@@ -214,8 +212,8 @@ impl Config {
                 )));
             }
             if matches!(scenario.virtual_users, Some(0)) {
-                return Err(Error::config(format!(
-                    "scenarios.{scenario_id}.virtual_users is 0; it must be a positive integer"
+                return Err(zero_virtual_users_error(format!(
+                    "scenarios.{scenario_id}.virtual_users"
                 )));
             }
             if let Some(profile) = &scenario.load_profile {
@@ -1602,15 +1600,15 @@ fn validate_load_profile(scenario_id: &str, profile: &LoadProfile) -> Result<()>
             "Scenario '{scenario_id}' load_profile.stages must not be empty"
         )));
     }
-    for stage in &profile.stages {
+    for (index, stage) in profile.stages.iter().enumerate() {
         if stage.duration_seconds == 0 {
             return Err(Error::config(format!(
                 "Scenario '{scenario_id}' load stage duration_seconds must be positive"
             )));
         }
         if matches!(stage.virtual_users, Some(0)) {
-            return Err(Error::config(format!(
-                "scenarios.{scenario_id} load stage virtual_users is 0; it must be a positive integer"
+            return Err(zero_virtual_users_error(format!(
+                "scenarios.{scenario_id}.load_profile.stages[{index}].virtual_users"
             )));
         }
         if let Some(target_rps) = stage.target_rps
@@ -1622,6 +1620,10 @@ fn validate_load_profile(scenario_id: &str, profile: &LoadProfile) -> Result<()>
         }
     }
     Ok(())
+}
+
+fn zero_virtual_users_error(path: impl std::fmt::Display) -> Error {
+    Error::config(format!("{path} is 0; it must be a positive integer"))
 }
 
 fn join_url_template(base_url: &str, url: &str) -> Result<String> {
@@ -1657,6 +1659,13 @@ fn parse_toml_error(source: &str, err: toml::de::Error) -> Error {
     parse_config_error("TOML", err)
 }
 
+fn parse_yaml_error(err: serde_yaml::Error) -> Error {
+    if let Some(rewritten) = rewrite_yaml_parse_error(&err) {
+        return Error::config(rewritten);
+    }
+    parse_config_error("YAML", err)
+}
+
 /// Rewrite a TOML serde error into `field.path + reason`.
 ///
 /// Uses `toml::de::Error::message()` / `span()` plus the source string to
@@ -1666,9 +1675,29 @@ fn rewrite_toml_parse_error(source: &str, err: &toml::de::Error) -> Option<Strin
     let message = err.message();
     let span = err.span()?;
     let table_path = toml_table_path_at(source, span.start);
+    let key = toml_key_on_line(source, span.start);
+    rewrite_recognized_parse_error(message, &table_path, key.as_deref())
+}
 
+/// Rewrite a YAML serde error into the same `field.path + reason` shape as TOML.
+///
+/// `serde_yaml_ng` already prefixes Display with its deserializer path
+/// (`global.duration_seconds: invalid type: … at line N column M`). Unrecognized
+/// parser text still dumps.
+fn rewrite_yaml_parse_error(err: &serde_yaml::Error) -> Option<String> {
+    let full = err.to_string();
+    let without_loc = strip_trailing_yaml_location(&full);
+    let (yaml_path, message) = split_yaml_path_prefix(without_loc);
+    rewrite_recognized_parse_error(message, yaml_path, yaml_path_key(yaml_path))
+}
+
+fn rewrite_recognized_parse_error(
+    message: &str,
+    table_path: &str,
+    key_on_line: Option<&str>,
+) -> Option<String> {
     if let Some(field) = parse_missing_field(message) {
-        let path = join_config_path(&table_path, &field);
+        let path = join_config_path(table_path, &field);
         let mut msg = format!("missing required field `{field}` at {path}");
         if path.starts_with("steps.") && (field == "name" || field == "url") {
             msg.push_str("; each step needs `name` and `url`");
@@ -1677,7 +1706,7 @@ fn rewrite_toml_parse_error(source: &str, err: &toml::de::Error) -> Option<Strin
     }
 
     if let Some((field, expected)) = parse_unknown_field(message) {
-        let path = join_config_path(&table_path, &field);
+        let path = join_config_path(table_path, &field);
         let mut msg = format!("unknown field `{field}` at {path}");
         if let Some(suggestion) = suggest_field(&field, &expected) {
             msg.push_str(&format!("; did you mean `{suggestion}`?"));
@@ -1689,10 +1718,9 @@ fn rewrite_toml_parse_error(source: &str, err: &toml::de::Error) -> Option<Strin
         if !is_integer_type(&expected_ty) {
             return None;
         }
-        let key = toml_key_on_line(source, span.start);
-        let path = match key {
-            Some(k) => join_config_path(&table_path, &k),
-            None if !table_path.is_empty() => table_path,
+        let path = match key_on_line {
+            Some(k) => join_config_path(table_path, k),
+            None if !table_path.is_empty() => table_path.to_string(),
             None => return None,
         };
         if path.ends_with("_ms") {
@@ -1706,6 +1734,58 @@ fn rewrite_toml_parse_error(source: &str, err: &toml::de::Error) -> Option<Strin
     }
 
     None
+}
+
+fn strip_trailing_yaml_location(message: &str) -> &str {
+    let Some(idx) = message.rfind(" at line ") else {
+        return message;
+    };
+    let loc = &message[idx + " at line ".len()..];
+    let Some((line, column)) = loc.split_once(" column ") else {
+        return message;
+    };
+    if line.bytes().all(|b| b.is_ascii_digit()) && column.bytes().all(|b| b.is_ascii_digit()) {
+        &message[..idx]
+    } else {
+        message
+    }
+}
+
+fn split_yaml_path_prefix(text: &str) -> (&str, &str) {
+    if looks_like_serde_message(text) {
+        return ("", text);
+    }
+    let Some((path, rest)) = text.split_once(": ") else {
+        return ("", text);
+    };
+    if is_config_error_path(path) {
+        (path, rest)
+    } else {
+        ("", text)
+    }
+}
+
+fn looks_like_serde_message(text: &str) -> bool {
+    text.starts_with("missing field ")
+        || text.starts_with("unknown field ")
+        || text.starts_with("invalid type:")
+}
+
+fn is_config_error_path(path: &str) -> bool {
+    !path.is_empty()
+        && path != "."
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '[' | ']'))
+}
+
+fn yaml_path_key(path: &str) -> Option<&str> {
+    let key = path.rsplit_once('.').map(|(_, key)| key).unwrap_or(path);
+    if key.is_empty() || key.contains('[') {
+        None
+    } else {
+        Some(key)
+    }
 }
 
 fn parse_missing_field(message: &str) -> Option<String> {
@@ -1742,20 +1822,7 @@ fn extract_backticked(s: &str) -> Vec<String> {
 }
 
 fn is_integer_type(expected: &str) -> bool {
-    matches!(
-        expected,
-        "u8" | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-    )
+    expected == "u64"
 }
 
 fn join_config_path(table: &str, field: &str) -> String {
@@ -1841,36 +1908,28 @@ fn toml_key_on_line(source: &str, offset: usize) -> Option<String> {
     Some(unquote_bare_key(line[..eq].trim()))
 }
 
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut curr = vec![0; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+fn is_near_field_typo(got: &str, expected: &str) -> bool {
+    if got == expected {
+        return false;
     }
-    prev[b.len()]
+    let prefix = common_prefix_len(got, expected);
+    prefix > 0 && got.len() - prefix <= 2 && expected.len() - prefix <= 2
 }
 
 fn suggest_field(got: &str, expected: &[String]) -> Option<String> {
-    let (best, dist) = expected
+    expected
         .iter()
-        .map(|candidate| (candidate.as_str(), levenshtein(got, candidate)))
-        .min_by_key(|(_, dist)| *dist)?;
-    if dist == 0 {
-        return None;
-    }
-    let max_len = got.len().max(best.len());
-    if dist <= 2 || (max_len > 0 && dist * 3 <= max_len) {
-        Some(best.to_string())
-    } else {
-        None
-    }
+        .filter(|candidate| is_near_field_typo(got, candidate))
+        .max_by_key(|candidate| common_prefix_len(got, candidate))
+        .cloned()
 }
 
 fn parse_config_error(format: &str, err: impl std::fmt::Display) -> Error {
@@ -1905,7 +1964,7 @@ fn map_step_url_build_error(step_id: &str, raw_url: &str, err: Error) -> Error {
     if inner.contains("absolute http(s) URL") {
         return Error::config(format!(
             "steps.{step_id}.url '{raw_url}' is not an absolute http(s) URL; \
-             set [global].base_url or use a full https:// URL"
+             set global.base_url or use a full https:// URL"
         ));
     }
     err
@@ -2191,7 +2250,7 @@ mod tests {
         assert!(
             err.contains("steps.step1.url")
                 && err.contains("/api/resource")
-                && err.contains("[global].base_url"),
+                && err.contains("global.base_url"),
             "expected field path and base_url hint, got {err}"
         );
     }
@@ -2711,6 +2770,25 @@ steps:
     }
 
     #[test]
+    fn test_parse_yaml_rejects_duration_string_with_integer_hint() {
+        let err = Config::from_yaml_str(
+            r#"
+global:
+  duration_seconds: "30s"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("global.duration_seconds")
+                && err.contains("number of seconds")
+                && err.contains("30s")
+                && !err.contains("Failed to parse YAML"),
+            "expected YAML duration rewrite, got {err}"
+        );
+    }
+
+    #[test]
     fn test_parse_rejects_missing_step_name_with_required_fields_hint() {
         let err = Config::from_toml_str(
             r#"
@@ -2759,6 +2837,79 @@ steps:
         assert!(
             !err.contains("Validation error:"),
             "load-path regex errors must not nest Validation error; got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_yaml_rejects_missing_step_name_with_required_fields_hint() {
+        let err = Config::from_yaml_str(
+            r#"
+scenarios:
+  s:
+    name: "S"
+    steps: ["a"]
+
+steps:
+  a:
+    url: "https://example.com/"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("steps.a.name")
+                && err.contains("missing required field")
+                && !err.contains("Failed to parse YAML"),
+            "expected YAML missing-field rewrite, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_yaml_rejects_unknown_field_with_suggestion() {
+        let err = Config::from_yaml_str(
+            r#"
+scenarios:
+  smoke:
+    name: "Smoke"
+    steps: []
+    virtual_userz: 50
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("scenarios.smoke.virtual_userz")
+                && err.contains("unknown field")
+                && err.contains("did you mean")
+                && err.contains("virtual_users")
+                && !err.contains("Failed to parse YAML"),
+            "expected YAML unknown-field rewrite, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_stage_virtual_users_with_indexed_path() {
+        let config = Config::from_toml_str(
+            r#"
+            [scenarios.smoke]
+            name = "Smoke"
+            steps = ["home"]
+
+            [[scenarios.smoke.load_profile.stages]]
+            duration_seconds = 1
+            virtual_users = 0
+
+            [steps.home]
+            name = "Home"
+            url = "https://example.com/"
+            "#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("scenarios.smoke.load_profile.stages[0].virtual_users is 0")
+                && err.contains("positive integer"),
+            "expected indexed stage path, got {err}"
         );
     }
 
