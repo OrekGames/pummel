@@ -95,7 +95,7 @@ impl Config {
 
     /// Load configuration from a TOML string
     pub fn from_toml_str(content: &str) -> Result<Self> {
-        toml::from_str(content).map_err(|e| parse_config_error("TOML", e))
+        toml::from_str(content).map_err(|e| parse_toml_error(content, e))
     }
 
     /// Save configuration to a TOML file
@@ -167,7 +167,9 @@ impl Config {
             ));
         }
         if self.global.virtual_users == 0 {
-            return Err(Error::config("global.virtual_users must be positive"));
+            return Err(Error::config(
+                "global.virtual_users is 0; it must be a positive integer",
+            ));
         }
 
         validate_headers("global.headers", &self.global.headers)?;
@@ -213,7 +215,7 @@ impl Config {
             }
             if matches!(scenario.virtual_users, Some(0)) {
                 return Err(Error::config(format!(
-                    "Scenario '{scenario_id}' virtual_users must be positive"
+                    "scenarios.{scenario_id}.virtual_users is 0; it must be a positive integer"
                 )));
             }
             if let Some(profile) = &scenario.load_profile {
@@ -434,8 +436,11 @@ impl Config {
             request
         };
 
-        // Build the request
-        let request = request.build()?;
+        // Build the request. URL failures from http.rs have no step path;
+        // rewrite them here so CLI output names `steps.{id}.url`.
+        let request = request
+            .build()
+            .map_err(|err| map_step_url_build_error(id, &config.url, err))?;
 
         // Create the step
         let mut step = Step::new(id, &config.name, request);
@@ -1605,7 +1610,7 @@ fn validate_load_profile(scenario_id: &str, profile: &LoadProfile) -> Result<()>
         }
         if matches!(stage.virtual_users, Some(0)) {
             return Err(Error::config(format!(
-                "Scenario '{scenario_id}' load stage virtual_users must be positive"
+                "scenarios.{scenario_id} load stage virtual_users is 0; it must be a positive integer"
             )));
         }
         if let Some(target_rps) = stage.target_rps
@@ -1645,6 +1650,229 @@ fn read_config_file(path: &Path) -> Result<String> {
     })
 }
 
+fn parse_toml_error(source: &str, err: toml::de::Error) -> Error {
+    if let Some(rewritten) = rewrite_toml_parse_error(source, &err) {
+        return Error::config(rewritten);
+    }
+    parse_config_error("TOML", err)
+}
+
+/// Rewrite a TOML serde error into `field.path + reason`.
+///
+/// Uses `toml::de::Error::message()` / `span()` plus the source string to
+/// recover paths like `steps.a.name` or `scenarios.smoke.virtual_userz`.
+/// Unrecognized errors fall back to the raw dump.
+fn rewrite_toml_parse_error(source: &str, err: &toml::de::Error) -> Option<String> {
+    let message = err.message();
+    let span = err.span()?;
+    let table_path = toml_table_path_at(source, span.start);
+
+    if let Some(field) = parse_missing_field(message) {
+        let path = join_config_path(&table_path, &field);
+        let mut msg = format!("missing required field `{field}` at {path}");
+        if path.starts_with("steps.") && (field == "name" || field == "url") {
+            msg.push_str("; each step needs `name` and `url`");
+        }
+        return Some(msg);
+    }
+
+    if let Some((field, expected)) = parse_unknown_field(message) {
+        let path = join_config_path(&table_path, &field);
+        let mut msg = format!("unknown field `{field}` at {path}");
+        if let Some(suggestion) = suggest_field(&field, &expected) {
+            msg.push_str(&format!("; did you mean `{suggestion}`?"));
+        }
+        return Some(msg);
+    }
+
+    if let Some((got, expected_ty)) = parse_invalid_string_type(message) {
+        if !is_integer_type(&expected_ty) {
+            return None;
+        }
+        let key = toml_key_on_line(source, span.start);
+        let path = match key {
+            Some(k) => join_config_path(&table_path, &k),
+            None if !table_path.is_empty() => table_path,
+            None => return None,
+        };
+        if path.ends_with("_ms") {
+            return Some(format!(
+                "{path} must be an integer number of milliseconds (for example 100), not the string {got}"
+            ));
+        }
+        return Some(format!(
+            "{path} must be an integer number of seconds (for example 30), not the string {got}"
+        ));
+    }
+
+    None
+}
+
+fn parse_missing_field(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("missing field `")?;
+    let (field, _) = rest.split_once('`')?;
+    Some(field.to_string())
+}
+
+fn parse_unknown_field(message: &str) -> Option<(String, Vec<String>)> {
+    let rest = message.strip_prefix("unknown field `")?;
+    let (field, rest) = rest.split_once('`')?;
+    Some((field.to_string(), extract_backticked(rest)))
+}
+
+fn parse_invalid_string_type(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("invalid type: string ")?;
+    let (quoted, expected) = rest.split_once(", expected ")?;
+    Some((quoted.to_string(), expected.trim().to_string()))
+}
+
+fn extract_backticked(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find('`') {
+            out.push(rest[..end].to_string());
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn is_integer_type(expected: &str) -> bool {
+    matches!(
+        expected,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+    )
+}
+
+fn join_config_path(table: &str, field: &str) -> String {
+    if table.is_empty() {
+        field.to_string()
+    } else if table == field || table.ends_with(&format!(".{field}")) {
+        table.to_string()
+    } else {
+        format!("{table}.{field}")
+    }
+}
+
+fn toml_table_path_at(source: &str, offset: usize) -> String {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[offset..]
+        .find('\n')
+        .map(|i| offset + i)
+        .unwrap_or(source.len());
+    if let Some(name) = parse_table_header(&source[line_start..line_end]) {
+        return name;
+    }
+
+    let mut last = String::new();
+    for line in source[..offset].lines() {
+        if let Some(name) = parse_table_header(line) {
+            last = name;
+        }
+    }
+    last
+}
+
+fn parse_table_header(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let (start, closer) = if trimmed.starts_with("[[") {
+        (2, "]]")
+    } else {
+        (1, "]")
+    };
+    let rest = trimmed.get(start..)?;
+    let end = rest.find(closer)?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(unquote_toml_path(name))
+}
+
+fn unquote_toml_path(name: &str) -> String {
+    name.split('.')
+        .map(|seg| unquote_bare_key(seg.trim()))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn unquote_bare_key(key: &str) -> String {
+    if key.len() >= 2
+        && ((key.starts_with('"') && key.ends_with('"'))
+            || (key.starts_with('\'') && key.ends_with('\'')))
+    {
+        key[1..key.len() - 1].to_string()
+    } else {
+        key.to_string()
+    }
+}
+
+fn toml_key_on_line(source: &str, offset: usize) -> Option<String> {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[offset..]
+        .find('\n')
+        .map(|i| offset + i)
+        .unwrap_or(source.len());
+    let line = source[line_start..line_end].trim();
+    if parse_table_header(line).is_some() {
+        return None;
+    }
+    let eq = line.find('=')?;
+    Some(unquote_bare_key(line[..eq].trim()))
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+fn suggest_field(got: &str, expected: &[String]) -> Option<String> {
+    let (best, dist) = expected
+        .iter()
+        .map(|candidate| (candidate.as_str(), levenshtein(got, candidate)))
+        .min_by_key(|(_, dist)| *dist)?;
+    if dist == 0 {
+        return None;
+    }
+    let max_len = got.len().max(best.len());
+    if dist <= 2 || (max_len > 0 && dist * 3 <= max_len) {
+        Some(best.to_string())
+    } else {
+        None
+    }
+}
+
 fn parse_config_error(format: &str, err: impl std::fmt::Display) -> Error {
     let msg = err.to_string();
     match config_parse_hint(&msg) {
@@ -1667,6 +1895,20 @@ fn config_parse_hint(msg: &str) -> Option<&'static str> {
         );
     }
     None
+}
+
+fn map_step_url_build_error(step_id: &str, raw_url: &str, err: Error) -> Error {
+    let inner = match &err {
+        Error::Config(msg) => msg.as_str(),
+        _ => return err,
+    };
+    if inner.contains("absolute http(s) URL") {
+        return Error::config(format!(
+            "steps.{step_id}.url '{raw_url}' is not an absolute http(s) URL; \
+             set [global].base_url or use a full https:// URL"
+        ));
+    }
+    err
 }
 
 fn invalid_base_url(base_url: &str, detail: impl std::fmt::Display) -> Error {
