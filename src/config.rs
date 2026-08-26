@@ -829,10 +829,8 @@ impl BranchConfig {
                     Error::config("branch condition 'matches_regex' requires a value")
                 })?;
                 let condition =
-                    BranchCondition::try_matches_regex(&self.variable, value).map_err(|_| {
-                        let e = regex::Regex::new(value).unwrap_err();
-                        Error::config(format!("invalid branch regex: {e}"))
-                    })?;
+                    BranchCondition::try_matches_regex(&self.variable, value)
+                        .map_err(|e| Error::config(e.to_string()))?;
                 Ok(condition)
             }
         }
