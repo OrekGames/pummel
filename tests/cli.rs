@@ -252,49 +252,51 @@ fn unsupported_extension_is_rejected() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+/// Trimmed primary CLI line: `src/bin/cli.rs` prints `error: {err}` and
+/// `Error::Config` displays `Configuration error: {0}`. Tracing may also write
+/// to stderr, so callers must extract this line rather than match the whole
+/// buffer.
+fn primary_config_error_line(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("error: Configuration error:"))
+        .unwrap_or("")
+}
+
+fn assert_primary_config_error(name: &str, code: Option<i32>, stderr: &str, expected: &str) {
+    assert_eq!(
+        code,
+        Some(1),
+        "{name}: expected config-error exit 1; stderr: {stderr}"
+    );
+    assert_eq!(
+        primary_config_error_line(stderr),
+        expected,
+        "{name}: primary stderr line mismatch; full stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to parse"),
+        "{name}: recognized config errors must not dump parser text; stderr: {stderr}"
+    );
+}
+
 /// Target CLI wording for common config mistakes (#36).
 ///
-/// Emit path: `src/bin/cli.rs` `main` prints `error: {err}` after `load_config`
-/// (`Config::from_toml` → `parse_config_error` in `src/config.rs`) or after
-/// `Engine::apply_config` / `build_scenarios` (`invalid_request_url` in
-/// `src/http.rs`, `Config::validate`).
+/// Contract: schema errors are `reason at path; optional hint`; value errors
+/// are `path reason; optional hint`. The complete primary line is
+/// `error: Configuration error: <payload>` — not unordered substring needles.
 ///
-/// These assert the *clearer* messages we want (field/path + what was wrong),
-/// not today's serde dump + tacked-on hint. They fail on current main and go
-/// green when Code Optimizer rewrites the emit path. Concrete before/after:
-///
-/// missing required field
-///   before: Failed to parse TOML: TOML parse error … missing field `name`.
-///           Required step fields are name and url…
-///   after:  missing required field `name` at steps.a.name; each step needs `name` and `url`
-///
-/// bad URL
-///   before: Request URL '/api' is not a valid absolute http(s) URL (relative
-///           URL without a base). Use a full URL … or set [global] base_url …
-///   after:  steps.a.url '/api' is not an absolute http(s) URL; set
-///           [global].base_url or use a full https:// URL
-///
-/// invalid duration
-///   before: Failed to parse TOML: … invalid type: string "30s", expected u64.
-///           This field is an integer count, not a string…
-///   after:  global.duration_seconds must be an integer number of seconds
-///           (for example 30), not the string "30s"
-///
-/// unknown field
-///   before: Failed to parse TOML: … unknown field `virtual_userz`, expected
-///           one of `name`, `steps`, `virtual_users`, …
-///   after:  unknown field `virtual_userz` at scenarios.smoke.virtual_userz;
-///           did you mean `virtual_users`?
-///
-/// zero virtual users
-///   before: Scenario 'smoke' virtual_users must be positive
-///   after:  scenarios.smoke.virtual_users is 0; it must be a positive integer
+/// Pins that fail until Code Optimizer lands the remaining rewrites:
+/// - bad URL hint uses `global.base_url`, not `[global].base_url`
+/// - indexed stage-zero uses `scenarios.smoke.load_profile.stages[0].virtual_users`
+/// - YAML missing-field uses the same primary line as TOML (no serde dump)
 #[test]
 fn common_config_mistakes_name_field_path_and_reason() {
     struct Case {
         name: &'static str,
         toml: &'static str,
-        needles: &'static [&'static str],
+        primary: &'static str,
     }
 
     let cases = [
@@ -308,7 +310,7 @@ steps = ["a"]
 [steps.a]
 url = "https://example.com/"
 "#,
-            needles: &["steps.a.name", "missing required field"],
+            primary: "error: Configuration error: missing required field `name` at steps.a.name; each step needs `name` and `url`",
         },
         Case {
             name: "bad URL",
@@ -322,7 +324,7 @@ name = "A"
 method = "GET"
 url = "/api"
 "#,
-            needles: &["steps.a.url", "/api", "[global].base_url"],
+            primary: "error: Configuration error: steps.a.url '/api' is not an absolute http(s) URL; set global.base_url or use a full https:// URL",
         },
         Case {
             name: "invalid duration",
@@ -339,7 +341,7 @@ name = "A"
 method = "GET"
 url = "https://example.com/"
 "#,
-            needles: &["global.duration_seconds", "\"30s\"", "number of seconds"],
+            primary: r#"error: Configuration error: global.duration_seconds must be an integer number of seconds (for example 30), not the string "30s""#,
         },
         Case {
             name: "unknown field",
@@ -349,15 +351,10 @@ name = "Smoke"
 steps = []
 virtual_userz = 50
 "#,
-            needles: &[
-                "scenarios.smoke.virtual_userz",
-                "unknown field",
-                "did you mean",
-                "virtual_users",
-            ],
+            primary: "error: Configuration error: unknown field `virtual_userz` at scenarios.smoke.virtual_userz; did you mean `virtual_users`?",
         },
         Case {
-            name: "zero virtual users",
+            name: "zero scenario virtual users",
             toml: r#"
 [scenarios.smoke]
 name = "Smoke"
@@ -369,30 +366,74 @@ name = "Home"
 method = "GET"
 url = "https://example.com/"
 "#,
-            needles: &[
-                "scenarios.smoke.virtual_users",
-                "virtual_users is 0",
-                "positive integer",
-            ],
+            primary: "error: Configuration error: scenarios.smoke.virtual_users is 0; it must be a positive integer",
+        },
+        Case {
+            name: "zero global virtual users",
+            toml: r#"
+[global]
+virtual_users = 0
+
+[scenarios.smoke]
+name = "Smoke"
+steps = ["home"]
+
+[steps.home]
+name = "Home"
+method = "GET"
+url = "https://example.com/"
+"#,
+            primary: "error: Configuration error: global.virtual_users is 0; it must be a positive integer",
+        },
+        Case {
+            name: "zero indexed load-stage virtual users",
+            toml: r#"
+[scenarios.smoke]
+name = "Smoke"
+steps = ["home"]
+
+[scenarios.smoke.load_profile]
+stages = [{ duration_seconds = 1, virtual_users = 0 }]
+
+[steps.home]
+name = "Home"
+method = "GET"
+url = "https://example.com/"
+"#,
+            primary: "error: Configuration error: scenarios.smoke.load_profile.stages[0].virtual_users is 0; it must be a positive integer",
         },
     ];
 
     for case in cases {
         let (code, stderr) = dry_run_stderr(case.toml);
-        assert_eq!(
-            code,
-            Some(1),
-            "{}: expected config-error exit 1; stderr: {stderr}",
-            case.name
-        );
-        for needle in case.needles {
-            assert!(
-                stderr.contains(needle),
-                "{}: stderr should contain {needle:?} (clearer field/path + reason); got: {stderr}",
-                case.name
-            );
-        }
+        assert_primary_config_error(case.name, code, &stderr, case.primary);
     }
+
+    // Same missing-field payload via YAML. Cheap parity pin; must not lock in
+    // the serde dump `from_yaml_str` still emits today.
+    let yaml = r#"
+scenarios:
+  s:
+    name: S
+    steps: ["a"]
+steps:
+  a:
+    url: "https://example.com/"
+"#;
+    let cfg = config_file("yaml", yaml);
+    let out = Command::new(bin())
+        .arg("--config")
+        .arg(cfg.path())
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_primary_config_error(
+        "missing required field (yaml)",
+        out.status.code(),
+        &stderr,
+        "error: Configuration error: missing required field `name` at steps.a.name; each step needs `name` and `url`",
+    );
 }
 
 #[test]
