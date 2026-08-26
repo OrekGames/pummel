@@ -1947,8 +1947,10 @@ mod tests {
         let config = Config::from_toml_str(toml_str).unwrap();
         let err = config.build_scenarios().unwrap_err().to_string();
         assert!(
-            err.contains("/api/resource") && err.contains("[global] base_url"),
-            "expected relative-URL hint, got {err}"
+            err.contains("steps.step1.url")
+                && err.contains("/api/resource")
+                && err.contains("[global].base_url"),
+            "expected field path and base_url hint, got {err}"
         );
     }
 
@@ -2459,8 +2461,10 @@ steps:
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("duration_seconds") && err.contains("not a string"),
-            "expected duration integer hint, got {err}"
+            err.contains("global.duration_seconds")
+                && err.contains("number of seconds")
+                && err.contains("30s"),
+            "expected field path and integer-seconds reason, got {err}"
         );
     }
 
@@ -2479,8 +2483,8 @@ steps:
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("missing field") && err.contains("name and url"),
-            "expected required-fields hint, got {err}"
+            err.contains("steps.a.name") && err.contains("missing required field"),
+            "expected field path and missing-required reason, got {err}"
         );
     }
 
