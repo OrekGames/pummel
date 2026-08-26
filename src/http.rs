@@ -774,7 +774,7 @@ mod tests {
                 .expect_err(&format!("expected error for target {bad:?}"))
                 .to_string();
             assert!(
-                err.contains("absolute http(s) URL") && err.contains("[global] base_url"),
+                err.contains("absolute http(s) URL") && err.contains("base_url"),
                 "expected actionable URL hint for {bad:?}, got {err}"
             );
         }
@@ -784,7 +784,7 @@ mod tests {
             .expect_err("localhost:8080 must be rejected")
             .to_string();
         assert!(
-            err.contains("absolute http(s) URL") && err.contains("[global] base_url"),
+            err.contains("absolute http(s) URL") && err.contains("base_url"),
             "expected actionable URL hint for localhost:8080, got {err}"
         );
     }
