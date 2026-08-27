@@ -95,7 +95,7 @@ impl Config {
 
     /// Load configuration from a TOML string
     pub fn from_toml_str(content: &str) -> Result<Self> {
-        toml::from_str(content).map_err(|e| parse_config_error("TOML", e))
+        toml::from_str(content).map_err(|e| parse_toml_error(content, e))
     }
 
     /// Save configuration to a TOML file
@@ -119,7 +119,7 @@ impl Config {
 
     /// Load configuration from a YAML string
     pub fn from_yaml_str(content: &str) -> Result<Self> {
-        serde_yaml::from_str(content).map_err(|e| parse_config_error("YAML", e))
+        serde_yaml::from_str(content).map_err(parse_yaml_error)
     }
 
     /// Save configuration to a YAML file
@@ -167,7 +167,7 @@ impl Config {
             ));
         }
         if self.global.virtual_users == 0 {
-            return Err(Error::config("global.virtual_users must be positive"));
+            return Err(zero_virtual_users_error("global.virtual_users"));
         }
 
         validate_headers("global.headers", &self.global.headers)?;
@@ -212,8 +212,8 @@ impl Config {
                 )));
             }
             if matches!(scenario.virtual_users, Some(0)) {
-                return Err(Error::config(format!(
-                    "Scenario '{scenario_id}' virtual_users must be positive"
+                return Err(zero_virtual_users_error(format!(
+                    "scenarios.{scenario_id}.virtual_users"
                 )));
             }
             if let Some(profile) = &scenario.load_profile {
@@ -434,8 +434,11 @@ impl Config {
             request
         };
 
-        // Build the request
-        let request = request.build()?;
+        // Build the request. URL failures from http.rs have no step path;
+        // rewrite them here so CLI output names `steps.{id}.url`.
+        let request = request
+            .build()
+            .map_err(|err| map_step_url_build_error(id, &config.url, err))?;
 
         // Create the step
         let mut step = Step::new(id, &config.name, request);
@@ -1597,15 +1600,15 @@ fn validate_load_profile(scenario_id: &str, profile: &LoadProfile) -> Result<()>
             "Scenario '{scenario_id}' load_profile.stages must not be empty"
         )));
     }
-    for stage in &profile.stages {
+    for (index, stage) in profile.stages.iter().enumerate() {
         if stage.duration_seconds == 0 {
             return Err(Error::config(format!(
                 "Scenario '{scenario_id}' load stage duration_seconds must be positive"
             )));
         }
         if matches!(stage.virtual_users, Some(0)) {
-            return Err(Error::config(format!(
-                "Scenario '{scenario_id}' load stage virtual_users must be positive"
+            return Err(zero_virtual_users_error(format!(
+                "scenarios.{scenario_id}.load_profile.stages[{index}].virtual_users"
             )));
         }
         if let Some(target_rps) = stage.target_rps
@@ -1617,6 +1620,10 @@ fn validate_load_profile(scenario_id: &str, profile: &LoadProfile) -> Result<()>
         }
     }
     Ok(())
+}
+
+fn zero_virtual_users_error(path: impl std::fmt::Display) -> Error {
+    Error::config(format!("{path} is 0; it must be a positive integer"))
 }
 
 fn join_url_template(base_url: &str, url: &str) -> Result<String> {
@@ -1645,6 +1652,286 @@ fn read_config_file(path: &Path) -> Result<String> {
     })
 }
 
+fn parse_toml_error(source: &str, err: toml::de::Error) -> Error {
+    if let Some(rewritten) = rewrite_toml_parse_error(source, &err) {
+        return Error::config(rewritten);
+    }
+    parse_config_error("TOML", err)
+}
+
+fn parse_yaml_error(err: serde_yaml::Error) -> Error {
+    if let Some(rewritten) = rewrite_yaml_parse_error(&err) {
+        return Error::config(rewritten);
+    }
+    parse_config_error("YAML", err)
+}
+
+/// Rewrite a TOML serde error into `field.path + reason`.
+///
+/// Uses `toml::de::Error::message()` / `span()` plus the source string to
+/// recover paths like `steps.a.name` or `scenarios.smoke.virtual_userz`.
+/// Unrecognized errors fall back to the raw dump.
+fn rewrite_toml_parse_error(source: &str, err: &toml::de::Error) -> Option<String> {
+    let message = err.message();
+    let span = err.span()?;
+    let table_path = toml_table_path_at(source, span.start);
+    let key = toml_key_on_line(source, span.start);
+    rewrite_recognized_parse_error(message, &table_path, key.as_deref())
+}
+
+/// Rewrite a YAML serde error into the same `field.path + reason` shape as TOML.
+///
+/// `serde_yaml_ng` already prefixes Display with its deserializer path
+/// (`global.duration_seconds: invalid type: … at line N column M`). Unrecognized
+/// parser text still dumps.
+fn rewrite_yaml_parse_error(err: &serde_yaml::Error) -> Option<String> {
+    let full = err.to_string();
+    let without_loc = strip_trailing_yaml_location(&full);
+    let (yaml_path, message) = split_yaml_path_prefix(without_loc);
+    rewrite_recognized_parse_error(message, yaml_path, yaml_path_key(yaml_path))
+}
+
+fn rewrite_recognized_parse_error(
+    message: &str,
+    table_path: &str,
+    key_on_line: Option<&str>,
+) -> Option<String> {
+    if let Some(field) = parse_missing_field(message) {
+        let path = join_config_path(table_path, &field);
+        let mut msg = format!("missing required field `{field}` at {path}");
+        if path.starts_with("steps.") && (field == "name" || field == "url") {
+            msg.push_str("; each step needs `name` and `url`");
+        }
+        return Some(msg);
+    }
+
+    if let Some((field, expected)) = parse_unknown_field(message) {
+        let path = join_config_path(table_path, &field);
+        let mut msg = format!("unknown field `{field}` at {path}");
+        if let Some(suggestion) = suggest_field(&field, &expected) {
+            msg.push_str(&format!("; did you mean `{suggestion}`?"));
+        }
+        return Some(msg);
+    }
+
+    if let Some((got, expected_ty)) = parse_invalid_string_type(message) {
+        if !is_integer_type(&expected_ty) {
+            return None;
+        }
+        let path = match key_on_line {
+            Some(k) => join_config_path(table_path, k),
+            None if !table_path.is_empty() => table_path.to_string(),
+            None => return None,
+        };
+        if path.ends_with("_ms") {
+            return Some(format!(
+                "{path} must be an integer number of milliseconds (for example 100), not the string {got}"
+            ));
+        }
+        return Some(format!(
+            "{path} must be an integer number of seconds (for example 30), not the string {got}"
+        ));
+    }
+
+    None
+}
+
+fn strip_trailing_yaml_location(message: &str) -> &str {
+    let Some(idx) = message.rfind(" at line ") else {
+        return message;
+    };
+    let loc = &message[idx + " at line ".len()..];
+    let Some((line, column)) = loc.split_once(" column ") else {
+        return message;
+    };
+    if line.bytes().all(|b| b.is_ascii_digit()) && column.bytes().all(|b| b.is_ascii_digit()) {
+        &message[..idx]
+    } else {
+        message
+    }
+}
+
+fn split_yaml_path_prefix(text: &str) -> (&str, &str) {
+    if looks_like_serde_message(text) {
+        return ("", text);
+    }
+    let Some((path, rest)) = text.split_once(": ") else {
+        return ("", text);
+    };
+    if is_config_error_path(path) {
+        (path, rest)
+    } else {
+        ("", text)
+    }
+}
+
+fn looks_like_serde_message(text: &str) -> bool {
+    text.starts_with("missing field ")
+        || text.starts_with("unknown field ")
+        || text.starts_with("invalid type:")
+}
+
+fn is_config_error_path(path: &str) -> bool {
+    !path.is_empty()
+        && path != "."
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '[' | ']'))
+}
+
+fn yaml_path_key(path: &str) -> Option<&str> {
+    let key = path.rsplit_once('.').map(|(_, key)| key).unwrap_or(path);
+    if key.is_empty() || key.contains('[') {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+fn parse_missing_field(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("missing field `")?;
+    let (field, _) = rest.split_once('`')?;
+    Some(field.to_string())
+}
+
+fn parse_unknown_field(message: &str) -> Option<(String, Vec<String>)> {
+    let rest = message.strip_prefix("unknown field `")?;
+    let (field, rest) = rest.split_once('`')?;
+    Some((field.to_string(), extract_backticked(rest)))
+}
+
+fn parse_invalid_string_type(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("invalid type: string ")?;
+    let (quoted, expected) = rest.split_once(", expected ")?;
+    Some((quoted.to_string(), expected.trim().to_string()))
+}
+
+fn extract_backticked(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find('`') {
+            out.push(rest[..end].to_string());
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn is_integer_type(expected: &str) -> bool {
+    expected == "u64"
+}
+
+fn join_config_path(table: &str, field: &str) -> String {
+    if table.is_empty() {
+        field.to_string()
+    } else if table == field || table.ends_with(&format!(".{field}")) {
+        table.to_string()
+    } else {
+        format!("{table}.{field}")
+    }
+}
+
+fn toml_table_path_at(source: &str, offset: usize) -> String {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[offset..]
+        .find('\n')
+        .map(|i| offset + i)
+        .unwrap_or(source.len());
+    if let Some(name) = parse_table_header(&source[line_start..line_end]) {
+        return name;
+    }
+
+    let mut last = String::new();
+    for line in source[..offset].lines() {
+        if let Some(name) = parse_table_header(line) {
+            last = name;
+        }
+    }
+    last
+}
+
+fn parse_table_header(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let (start, closer) = if trimmed.starts_with("[[") {
+        (2, "]]")
+    } else {
+        (1, "]")
+    };
+    let rest = trimmed.get(start..)?;
+    let end = rest.find(closer)?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(unquote_toml_path(name))
+}
+
+fn unquote_toml_path(name: &str) -> String {
+    name.split('.')
+        .map(|seg| unquote_bare_key(seg.trim()))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn unquote_bare_key(key: &str) -> String {
+    if key.len() >= 2
+        && ((key.starts_with('"') && key.ends_with('"'))
+            || (key.starts_with('\'') && key.ends_with('\'')))
+    {
+        key[1..key.len() - 1].to_string()
+    } else {
+        key.to_string()
+    }
+}
+
+fn toml_key_on_line(source: &str, offset: usize) -> Option<String> {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[offset..]
+        .find('\n')
+        .map(|i| offset + i)
+        .unwrap_or(source.len());
+    let line = source[line_start..line_end].trim();
+    if parse_table_header(line).is_some() {
+        return None;
+    }
+    let eq = line.find('=')?;
+    Some(unquote_bare_key(line[..eq].trim()))
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+fn is_near_field_typo(got: &str, expected: &str) -> bool {
+    if got == expected {
+        return false;
+    }
+    let prefix = common_prefix_len(got, expected);
+    prefix > 0 && got.len() - prefix <= 2 && expected.len() - prefix <= 2
+}
+
+fn suggest_field(got: &str, expected: &[String]) -> Option<String> {
+    expected
+        .iter()
+        .filter(|candidate| is_near_field_typo(got, candidate))
+        .max_by_key(|candidate| common_prefix_len(got, candidate))
+        .cloned()
+}
+
 fn parse_config_error(format: &str, err: impl std::fmt::Display) -> Error {
     let msg = err.to_string();
     match config_parse_hint(&msg) {
@@ -1667,6 +1954,20 @@ fn config_parse_hint(msg: &str) -> Option<&'static str> {
         );
     }
     None
+}
+
+fn map_step_url_build_error(step_id: &str, raw_url: &str, err: Error) -> Error {
+    let inner = match &err {
+        Error::Config(msg) => msg.as_str(),
+        _ => return err,
+    };
+    if inner.contains("absolute http(s) URL") {
+        return Error::config(format!(
+            "steps.{step_id}.url '{raw_url}' is not an absolute http(s) URL; \
+             set global.base_url or use a full https:// URL"
+        ));
+    }
+    err
 }
 
 fn invalid_base_url(base_url: &str, detail: impl std::fmt::Display) -> Error {
@@ -1947,8 +2248,10 @@ mod tests {
         let config = Config::from_toml_str(toml_str).unwrap();
         let err = config.build_scenarios().unwrap_err().to_string();
         assert!(
-            err.contains("/api/resource") && err.contains("[global] base_url"),
-            "expected relative-URL hint, got {err}"
+            err.contains("steps.step1.url")
+                && err.contains("/api/resource")
+                && err.contains("global.base_url"),
+            "expected field path and base_url hint, got {err}"
         );
     }
 
@@ -2459,8 +2762,29 @@ steps:
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("duration_seconds") && err.contains("not a string"),
-            "expected duration integer hint, got {err}"
+            err.contains("global.duration_seconds")
+                && err.contains("number of seconds")
+                && err.contains("30s"),
+            "expected field path and integer-seconds reason, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_yaml_rejects_duration_string_with_integer_hint() {
+        let err = Config::from_yaml_str(
+            r#"
+global:
+  duration_seconds: "30s"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("global.duration_seconds")
+                && err.contains("number of seconds")
+                && err.contains("30s")
+                && !err.contains("Failed to parse YAML"),
+            "expected YAML duration rewrite, got {err}"
         );
     }
 
@@ -2479,8 +2803,8 @@ steps:
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("missing field") && err.contains("name and url"),
-            "expected required-fields hint, got {err}"
+            err.contains("steps.a.name") && err.contains("missing required field"),
+            "expected field path and missing-required reason, got {err}"
         );
     }
 
@@ -2513,6 +2837,79 @@ steps:
         assert!(
             !err.contains("Validation error:"),
             "load-path regex errors must not nest Validation error; got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_yaml_rejects_missing_step_name_with_required_fields_hint() {
+        let err = Config::from_yaml_str(
+            r#"
+scenarios:
+  s:
+    name: "S"
+    steps: ["a"]
+
+steps:
+  a:
+    url: "https://example.com/"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("steps.a.name")
+                && err.contains("missing required field")
+                && !err.contains("Failed to parse YAML"),
+            "expected YAML missing-field rewrite, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_yaml_rejects_unknown_field_with_suggestion() {
+        let err = Config::from_yaml_str(
+            r#"
+scenarios:
+  smoke:
+    name: "Smoke"
+    steps: []
+    virtual_userz: 50
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("scenarios.smoke.virtual_userz")
+                && err.contains("unknown field")
+                && err.contains("did you mean")
+                && err.contains("virtual_users")
+                && !err.contains("Failed to parse YAML"),
+            "expected YAML unknown-field rewrite, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_stage_virtual_users_with_indexed_path() {
+        let config = Config::from_toml_str(
+            r#"
+            [scenarios.smoke]
+            name = "Smoke"
+            steps = ["home"]
+
+            [[scenarios.smoke.load_profile.stages]]
+            duration_seconds = 1
+            virtual_users = 0
+
+            [steps.home]
+            name = "Home"
+            url = "https://example.com/"
+            "#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("scenarios.smoke.load_profile.stages[0].virtual_users is 0")
+                && err.contains("positive integer"),
+            "expected indexed stage path, got {err}"
         );
     }
 
