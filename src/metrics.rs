@@ -690,23 +690,13 @@ fn ts_to_datetime(ms: i64) -> DateTime<Utc> {
 // ---------------------------------------------------------------------------
 
 /// Owned (scenario, step) map key.
-#[derive(Clone, Debug, Eq)]
+///
+/// Field order is the borrowed-lookup contract: derived [`Hash`]/[`Eq`] must
+/// stay scenario-then-step so they match [`AggregateKeyView`] (`(&str, &str)`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AggregateKey {
     scenario_id: ScenarioId,
     step_id: StepId,
-}
-
-impl PartialEq for AggregateKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.scenario_id == other.scenario_id && self.step_id == other.step_id
-    }
-}
-
-impl std::hash::Hash for AggregateKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.scenario_id.hash(state);
-        self.step_id.hash(state);
-    }
 }
 
 /// Borrowed view of an [`AggregateKey`] for zero-alloc DashMap lookups.
@@ -989,8 +979,8 @@ impl InMemoryMetricsCollector {
 #[async_trait]
 impl MetricsCollector for InMemoryMetricsCollector {
     async fn record_request(&self, metrics: RequestMetrics) -> Result<()> {
-        // Read the primitive fields, then move the owned key strings into the
-        // map key so nothing is cloned on the hot path.
+        // Borrowed get-or-insert: key strings are allocated only when this
+        // (scenario, step) aggregate does not already exist.
         let latency_ms = metrics.response_time_ms;
         let started_ms = metrics.timestamp.timestamp_millis();
         let completed_ms = metrics.completed_at.timestamp_millis();
@@ -1327,6 +1317,147 @@ mod tests {
         assert_eq!(full_step.name, slim_step.name);
         assert!(full.accepts_attempt_summary());
         assert!(!NoopMetricsCollector::new().records_requests());
+    }
+
+    #[test]
+    fn test_aggregate_key_hash_eq_matches_borrowed_view() {
+        use std::hash::{Hash, Hasher};
+
+        let key = AggregateKey {
+            scenario_id: "scenario1".to_string(),
+            step_id: "step1".to_string(),
+        };
+        let borrowed: &(dyn AggregateKeyView + '_) = &("scenario1", "step1");
+
+        let mut owned_hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut view_hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut owned_hasher);
+        borrowed.hash(&mut view_hasher);
+        assert_eq!(
+            owned_hasher.finish(),
+            view_hasher.finish(),
+            "owned AggregateKey hash must match borrowed AggregateKeyView"
+        );
+
+        let map: DashMap<AggregateKey, u8> = DashMap::new();
+        map.insert(key, 1);
+        assert_eq!(map.get(borrowed).map(|v| *v), Some(1));
+    }
+
+    /// Same-key concurrent records must not lose updates (atomics + get-then-insert).
+    ///
+    /// Uses OS threads so overlapping writers actually race. `#[tokio::test]`
+    /// defaults to `current_thread`, and these record methods have no `.await`,
+    /// so spawned tasks would run sequentially and miss the race.
+    #[test]
+    fn test_concurrent_same_key_record_no_lost_updates() {
+        const TASKS: usize = 32;
+        const PER_TASK: u64 = 50;
+        const FAILS_PER_TASK: u64 = 10;
+        let expected = (TASKS as u64) * PER_TASK;
+        let expected_fail = (TASKS as u64) * FAILS_PER_TASK;
+        let expected_ok = expected - expected_fail;
+        let elapsed = Duration::from_millis(10);
+        let request = Request::get("https://example.com").build().unwrap();
+        let ok_response = Response::new(
+            StatusCode::OK,
+            reqwest::header::HeaderMap::new(),
+            crate::http::Body::Empty,
+            elapsed,
+        );
+        let err_response = Response::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::header::HeaderMap::new(),
+            crate::http::Body::Empty,
+            elapsed,
+        );
+
+        for (use_summary, unique_vus) in [(true, true), (false, true), (true, false)] {
+            let collector = Arc::new(InMemoryMetricsCollector::new());
+            let barrier = Arc::new(std::sync::Barrier::new(TASKS));
+            let handles: Vec<_> = (0..TASKS)
+                .map(|task| {
+                    let collector = Arc::clone(&collector);
+                    let barrier = Arc::clone(&barrier);
+                    let request = request.clone();
+                    let ok_response = ok_response.clone();
+                    let err_response = err_response.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for n in 0..PER_TASK {
+                            let success = n >= FAILS_PER_TASK;
+                            let vu_id = if unique_vus { task as u32 } else { 7 };
+                            futures::executor::block_on(async {
+                                if use_summary {
+                                    collector
+                                        .record_attempt_summary(AttemptSummary {
+                                            scenario_id: "scenario1",
+                                            step_id: "step1",
+                                            step_name: "Step 1",
+                                            scenario_name: "Scenario 1",
+                                            virtual_user_id: vu_id,
+                                            success,
+                                            elapsed,
+                                        })
+                                        .await
+                                        .unwrap();
+                                } else {
+                                    collector
+                                        .record_request(RequestMetrics::new(RequestMetricsParams {
+                                            id: format!("req-{task}-{n}"),
+                                            step_id: "step1".to_string(),
+                                            step_name: "Step 1".to_string(),
+                                            scenario_id: "scenario1".to_string(),
+                                            scenario_name: "Scenario 1".to_string(),
+                                            virtual_user_id: vu_id,
+                                            request: &request,
+                                            response: Some(if success {
+                                                &ok_response
+                                            } else {
+                                                &err_response
+                                            }),
+                                            error: (!success).then(|| "boom".to_string()),
+                                            elapsed,
+                                        }))
+                                        .await
+                                        .unwrap();
+                                }
+                            });
+                        }
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                handle.join().expect("worker thread panicked");
+            }
+
+            let (step, scenario) = futures::executor::block_on(async {
+                let step = collector
+                    .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let scenario = collector
+                    .get_scenario_metrics(&"scenario1".to_string())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (step, scenario)
+            });
+            assert_eq!(
+                step.total_requests, expected,
+                "lost updates on use_summary={use_summary} unique_vus={unique_vus}"
+            );
+            assert_eq!(step.successful_requests, expected_ok);
+            assert_eq!(step.failed_requests, expected_fail);
+            assert_eq!(step.avg_response_time_ms, 10.0);
+            assert_eq!(
+                scenario.virtual_users,
+                if unique_vus { TASKS as u32 } else { 1 },
+                "distinct VU count on use_summary={use_summary} unique_vus={unique_vus}"
+            );
+        }
     }
 
     #[tokio::test]
