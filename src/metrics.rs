@@ -670,7 +670,12 @@ impl StepAggregate {
             .fetch_min(started_ms, Ordering::Relaxed);
         self.last_completed_ts_ms
             .fetch_max(completed_ms, Ordering::Relaxed);
-        self.vu_ids.insert(vu_id);
+        // Common case: the VU already recorded against this step. `contains` takes
+        // a shared shard lock; `insert` is exclusive. Skip the exclusive path once
+        // the id is known (distinct-VU count is unchanged either way).
+        if !self.vu_ids.contains(&vu_id) {
+            self.vu_ids.insert(vu_id);
+        }
     }
 }
 
@@ -678,6 +683,65 @@ impl StepAggregate {
 /// for the sentinel values used before any request is recorded.
 fn ts_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate map key (owned + borrowed lookup)
+// ---------------------------------------------------------------------------
+
+/// Owned (scenario, step) map key.
+///
+/// Field order is the borrowed-lookup contract: derived [`Hash`]/[`Eq`] must
+/// stay scenario-then-step so they match [`AggregateKeyView`] (`(&str, &str)`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AggregateKey {
+    scenario_id: ScenarioId,
+    step_id: StepId,
+}
+
+/// Borrowed view of an [`AggregateKey`] for zero-alloc DashMap lookups.
+trait AggregateKeyView {
+    fn scenario_id(&self) -> &str;
+    fn step_id(&self) -> &str;
+}
+
+impl AggregateKeyView for AggregateKey {
+    fn scenario_id(&self) -> &str {
+        &self.scenario_id
+    }
+    fn step_id(&self) -> &str {
+        &self.step_id
+    }
+}
+
+impl AggregateKeyView for (&str, &str) {
+    fn scenario_id(&self) -> &str {
+        self.0
+    }
+    fn step_id(&self) -> &str {
+        self.1
+    }
+}
+
+impl std::hash::Hash for dyn AggregateKeyView + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.scenario_id().hash(state);
+        self.step_id().hash(state);
+    }
+}
+
+impl PartialEq for dyn AggregateKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.scenario_id() == other.scenario_id() && self.step_id() == other.step_id()
+    }
+}
+
+impl Eq for dyn AggregateKeyView + '_ {}
+
+impl<'a> std::borrow::Borrow<dyn AggregateKeyView + 'a> for AggregateKey {
+    fn borrow(&self) -> &(dyn AggregateKeyView + 'a) {
+        self
+    }
 }
 
 /// In-memory streaming metrics collector.
@@ -689,8 +753,10 @@ fn ts_to_datetime(ms: i64) -> DateTime<Utc> {
 #[derive(Clone)]
 pub struct InMemoryMetricsCollector {
     /// Running aggregates keyed by (scenario id, step id). Wrapped in `Arc` so
-    /// all clones of the collector share the same data.
-    steps: Arc<DashMap<(ScenarioId, StepId), Arc<StepAggregate>>>,
+    /// all clones of the collector share the same data. Lookups use borrowed
+    /// `&str` pairs via [`AggregateKeyView`] so the hot path needs no per-request
+    /// `String` allocations; `get` (shared lock) is preferred over `entry`.
+    steps: Arc<DashMap<AggregateKey, Arc<StepAggregate>>>,
 }
 
 /// Parameters for recording an attempt into the streaming aggregate.
@@ -717,14 +783,28 @@ impl InMemoryMetricsCollector {
         }
     }
 
+    /// Resolve the per-(scenario, step) aggregate for a record attempt.
+    ///
+    /// Common case (key already present): one shared-lock `get` with borrowed
+    /// `&str` keys, then `Arc` clone — no `String` allocation and no exclusive
+    /// shard lock. Cold path allocates and uses `entry` only when inserting.
+    fn get_or_create_aggregate(&self, scenario_id: &str, step_id: &str) -> Arc<StepAggregate> {
+        let borrowed: &(dyn AggregateKeyView + '_) = &(scenario_id, step_id);
+        if let Some(existing) = self.steps.get(borrowed) {
+            return existing.clone();
+        }
+        self.steps
+            .entry(AggregateKey {
+                scenario_id: scenario_id.to_owned(),
+                step_id: step_id.to_owned(),
+            })
+            .or_insert_with(|| Arc::new(StepAggregate::new()))
+            .clone()
+    }
+
     /// Apply one attempt to the streaming aggregate (shared by full and slim paths).
     fn record_into_aggregate(&self, record: AggregateRecord) {
-        let key = (record.scenario_id, record.step_id);
-        let agg = self
-            .steps
-            .entry(key)
-            .or_insert_with(|| Arc::new(StepAggregate::new()))
-            .clone();
+        let agg = self.get_or_create_aggregate(&record.scenario_id, &record.step_id);
         // Capture the human-readable names once, from the first request seen.
         agg.step_name.get_or_init(|| record.step_name);
         agg.scenario_name.get_or_init(|| record.scenario_name);
@@ -886,11 +966,11 @@ impl InMemoryMetricsCollector {
         let mut by_scenario: HashMap<ScenarioId, Vec<(StepId, Arc<StepAggregate>)>> =
             HashMap::new();
         for entry in self.steps.iter() {
-            let (scenario_id, step_id) = entry.key();
+            let key = entry.key();
             by_scenario
-                .entry(scenario_id.clone())
+                .entry(key.scenario_id.clone())
                 .or_default()
-                .push((step_id.clone(), entry.value().clone()));
+                .push((key.step_id.clone(), entry.value().clone()));
         }
         by_scenario
     }
@@ -899,8 +979,8 @@ impl InMemoryMetricsCollector {
 #[async_trait]
 impl MetricsCollector for InMemoryMetricsCollector {
     async fn record_request(&self, metrics: RequestMetrics) -> Result<()> {
-        // Read the primitive fields, then move the owned key strings into the
-        // map key so nothing is cloned on the hot path.
+        // Borrowed get-or-insert: key strings are allocated only when this
+        // (scenario, step) aggregate does not already exist.
         let latency_ms = metrics.response_time_ms;
         let started_ms = metrics.timestamp.timestamp_millis();
         let completed_ms = metrics.completed_at.timestamp_millis();
@@ -923,25 +1003,23 @@ impl MetricsCollector for InMemoryMetricsCollector {
     }
 
     async fn record_attempt_summary(&self, summary: AttemptSummary<'_>) -> Result<()> {
-        let completed_at = Utc::now();
-        let completed_ms = completed_at.timestamp_millis();
-        let started_ms = (completed_at
-            - chrono::Duration::from_std(summary.elapsed)
-                .unwrap_or_else(|_| chrono::Duration::zero()))
-        .timestamp_millis();
-        let key = (summary.scenario_id.to_owned(), summary.step_id.to_owned());
-        let agg = self
-            .steps
-            .entry(key)
-            .or_insert_with(|| Arc::new(StepAggregate::new()))
-            .clone();
+        // Match [`RequestMetrics::new`]: derive start from integer ms so we avoid
+        // `Duration::from_std` on every slim-path attempt. Wall-clock window is
+        // millisecond-resolution either way once stored as chrono millis.
+        let latency_ms = summary.elapsed.as_millis() as u64;
+        let completed_ms = Utc::now().timestamp_millis();
+        let started_ms = match i64::try_from(latency_ms) {
+            Ok(ms) => completed_ms.saturating_sub(ms),
+            Err(_) => completed_ms,
+        };
+        let agg = self.get_or_create_aggregate(summary.scenario_id, summary.step_id);
         // Clone display names only on first insert; later attempts borrow.
         agg.step_name.get_or_init(|| summary.step_name.to_owned());
         agg.scenario_name
             .get_or_init(|| summary.scenario_name.to_owned());
         agg.record(
             summary.success,
-            summary.elapsed.as_millis() as u64,
+            latency_ms,
             started_ms,
             completed_ms,
             summary.virtual_user_id,
@@ -954,9 +1032,10 @@ impl MetricsCollector for InMemoryMetricsCollector {
         scenario_id: &ScenarioId,
         step_id: &StepId,
     ) -> Result<Option<StepMetrics>> {
+        let borrowed: &(dyn AggregateKeyView + '_) = &(scenario_id.as_str(), step_id.as_str());
         Ok(self
             .steps
-            .get(&(scenario_id.clone(), step_id.clone()))
+            .get(borrowed)
             .map(|entry| Self::build_step_metrics(step_id, entry.value())))
     }
 
@@ -967,8 +1046,8 @@ impl MetricsCollector for InMemoryMetricsCollector {
         let entries: Vec<(StepId, Arc<StepAggregate>)> = self
             .steps
             .iter()
-            .filter(|e| e.key().0 == *scenario_id)
-            .map(|e| (e.key().1.clone(), e.value().clone()))
+            .filter(|e| e.key().scenario_id == *scenario_id)
+            .map(|e| (e.key().step_id.clone(), e.value().clone()))
             .collect();
         Ok(Self::build_scenario_metrics(scenario_id, &entries))
     }
@@ -1238,6 +1317,147 @@ mod tests {
         assert_eq!(full_step.name, slim_step.name);
         assert!(full.accepts_attempt_summary());
         assert!(!NoopMetricsCollector::new().records_requests());
+    }
+
+    #[test]
+    fn test_aggregate_key_hash_eq_matches_borrowed_view() {
+        use std::hash::{Hash, Hasher};
+
+        let key = AggregateKey {
+            scenario_id: "scenario1".to_string(),
+            step_id: "step1".to_string(),
+        };
+        let borrowed: &(dyn AggregateKeyView + '_) = &("scenario1", "step1");
+
+        let mut owned_hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut view_hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut owned_hasher);
+        borrowed.hash(&mut view_hasher);
+        assert_eq!(
+            owned_hasher.finish(),
+            view_hasher.finish(),
+            "owned AggregateKey hash must match borrowed AggregateKeyView"
+        );
+
+        let map: DashMap<AggregateKey, u8> = DashMap::new();
+        map.insert(key, 1);
+        assert_eq!(map.get(borrowed).map(|v| *v), Some(1));
+    }
+
+    /// Same-key concurrent records must not lose updates (atomics + get-then-insert).
+    ///
+    /// Uses OS threads so overlapping writers actually race. `#[tokio::test]`
+    /// defaults to `current_thread`, and these record methods have no `.await`,
+    /// so spawned tasks would run sequentially and miss the race.
+    #[test]
+    fn test_concurrent_same_key_record_no_lost_updates() {
+        const TASKS: usize = 32;
+        const PER_TASK: u64 = 50;
+        const FAILS_PER_TASK: u64 = 10;
+        let expected = (TASKS as u64) * PER_TASK;
+        let expected_fail = (TASKS as u64) * FAILS_PER_TASK;
+        let expected_ok = expected - expected_fail;
+        let elapsed = Duration::from_millis(10);
+        let request = Request::get("https://example.com").build().unwrap();
+        let ok_response = Response::new(
+            StatusCode::OK,
+            reqwest::header::HeaderMap::new(),
+            crate::http::Body::Empty,
+            elapsed,
+        );
+        let err_response = Response::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::header::HeaderMap::new(),
+            crate::http::Body::Empty,
+            elapsed,
+        );
+
+        for (use_summary, unique_vus) in [(true, true), (false, true), (true, false)] {
+            let collector = Arc::new(InMemoryMetricsCollector::new());
+            let barrier = Arc::new(std::sync::Barrier::new(TASKS));
+            let handles: Vec<_> = (0..TASKS)
+                .map(|task| {
+                    let collector = Arc::clone(&collector);
+                    let barrier = Arc::clone(&barrier);
+                    let request = request.clone();
+                    let ok_response = ok_response.clone();
+                    let err_response = err_response.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for n in 0..PER_TASK {
+                            let success = n >= FAILS_PER_TASK;
+                            let vu_id = if unique_vus { task as u32 } else { 7 };
+                            futures::executor::block_on(async {
+                                if use_summary {
+                                    collector
+                                        .record_attempt_summary(AttemptSummary {
+                                            scenario_id: "scenario1",
+                                            step_id: "step1",
+                                            step_name: "Step 1",
+                                            scenario_name: "Scenario 1",
+                                            virtual_user_id: vu_id,
+                                            success,
+                                            elapsed,
+                                        })
+                                        .await
+                                        .unwrap();
+                                } else {
+                                    collector
+                                        .record_request(RequestMetrics::new(RequestMetricsParams {
+                                            id: format!("req-{task}-{n}"),
+                                            step_id: "step1".to_string(),
+                                            step_name: "Step 1".to_string(),
+                                            scenario_id: "scenario1".to_string(),
+                                            scenario_name: "Scenario 1".to_string(),
+                                            virtual_user_id: vu_id,
+                                            request: &request,
+                                            response: Some(if success {
+                                                &ok_response
+                                            } else {
+                                                &err_response
+                                            }),
+                                            error: (!success).then(|| "boom".to_string()),
+                                            elapsed,
+                                        }))
+                                        .await
+                                        .unwrap();
+                                }
+                            });
+                        }
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                handle.join().expect("worker thread panicked");
+            }
+
+            let (step, scenario) = futures::executor::block_on(async {
+                let step = collector
+                    .get_step_metrics(&"scenario1".to_string(), &"step1".to_string())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let scenario = collector
+                    .get_scenario_metrics(&"scenario1".to_string())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (step, scenario)
+            });
+            assert_eq!(
+                step.total_requests, expected,
+                "lost updates on use_summary={use_summary} unique_vus={unique_vus}"
+            );
+            assert_eq!(step.successful_requests, expected_ok);
+            assert_eq!(step.failed_requests, expected_fail);
+            assert_eq!(step.avg_response_time_ms, 10.0);
+            assert_eq!(
+                scenario.virtual_users,
+                if unique_vus { TASKS as u32 } else { 1 },
+                "distinct VU count on use_summary={use_summary} unique_vus={unique_vus}"
+            );
+        }
     }
 
     #[tokio::test]
