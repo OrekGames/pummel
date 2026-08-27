@@ -287,7 +287,7 @@ fn assert_primary_config_error(name: &str, code: Option<i32>, stderr: &str, expe
 /// are `path reason; optional hint`. The complete primary line is
 /// `error: Configuration error: <payload>` — not unordered substring needles.
 ///
-/// Pins that fail until Code Optimizer lands the remaining rewrites:
+/// Also pins:
 /// - bad URL hint uses `global.base_url`, not `[global].base_url`
 /// - indexed stage-zero uses `scenarios.smoke.load_profile.stages[0].virtual_users`
 /// - YAML missing-field uses the same primary line as TOML (no serde dump)
@@ -409,8 +409,8 @@ url = "https://example.com/"
         assert_primary_config_error(case.name, code, &stderr, case.primary);
     }
 
-    // Same missing-field payload via YAML. Cheap parity pin; must not lock in
-    // the serde dump `from_yaml_str` still emits today.
+    // Same missing-field payload via YAML. Cheap parity pin; recognized
+    // YAML parse errors must not dump serde text.
     let yaml = r#"
 scenarios:
   s:
