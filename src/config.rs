@@ -828,9 +828,7 @@ impl BranchConfig {
                 let value = self.value.as_ref().ok_or_else(|| {
                     Error::config("branch condition 'matches_regex' requires a value")
                 })?;
-                let condition = BranchCondition::try_matches_regex(&self.variable, value)
-                    .map_err(|e| Error::config(e.to_string()))?;
-                Ok(condition)
+                Ok(BranchCondition::try_matches_regex(&self.variable, value)?)
             }
         }
     }
@@ -2483,6 +2481,38 @@ steps:
         assert!(
             err.contains("missing field") && err.contains("name and url"),
             "expected required-fields hint, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_invalid_matches_regex_reports_regex_error() {
+        let err = Config::from_toml_str(
+            r#"
+            [scenarios.s]
+            name = "S"
+            steps = ["a"]
+
+            [steps.a]
+            name = "A"
+            url = "https://example.com/"
+
+            [steps.a.branch]
+            variable = "flag"
+            condition = "matches_regex"
+            value = "["
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("invalid branch regex") && !err.contains("missing compiled_regex"),
+            "expected compile error, not missing handle; got {err}"
+        );
+        assert!(
+            !err.contains("Validation error:"),
+            "load-path regex errors must not nest Validation error; got {err}"
         );
     }
 

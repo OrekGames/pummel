@@ -557,7 +557,7 @@ fn branch_matches(
                     Ok(regex.is_match(&haystack))
                 } else {
                     Err(Error::validation(
-                        "MatchesRegex branch requires a pattern".to_string(),
+                        "MatchesRegex branch missing compiled_regex".to_string(),
                     ))
                 }
             }

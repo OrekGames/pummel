@@ -419,7 +419,7 @@ impl BranchCondition {
     ) -> Result<Self> {
         let value = pattern.into();
         let compiled_regex = regex::Regex::new(&value)
-            .map_err(|e| Error::validation(format!("invalid branch regex: {e}")))?;
+            .map_err(|e| Error::config(format!("invalid branch regex: {e}")))?;
         Ok(Self {
             variable: variable.into(),
             operator: BranchOperator::MatchesRegex,
@@ -1361,6 +1361,30 @@ mod tests {
         let leaf_steps = scenario.get_leaf_steps();
         assert_eq!(leaf_steps.len(), 1);
         assert_eq!(leaf_steps[0].id, "step2");
+    }
+
+    #[test]
+    fn test_validate_reports_missing_compiled_regex() {
+        let request = Request::get("https://example.com").build().unwrap();
+        let mut branch = BranchCondition::matches_regex("flag", "^ok$");
+        assert!(
+            branch.compiled_regex.is_some(),
+            "valid pattern must compile"
+        );
+        branch.compiled_regex = None;
+        let step = StepBuilder::new("maybe", "Maybe", request)
+            .branch(branch)
+            .build();
+        let err = ScenarioBuilder::new("s", "S")
+            .step(step)
+            .duration(Duration::from_secs(0))
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing compiled_regex") && !err.contains("invalid MatchesRegex pattern"),
+            "expected missing handle, not a compile error; got {err}"
+        );
     }
 
     #[test]
