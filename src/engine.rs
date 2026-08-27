@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -352,52 +353,85 @@ fn value_to_template_string(value: &serde_json::Value) -> String {
     }
 }
 
-fn resolve_template_expr(ctx: &VuContext, step_id: &str, expr: &str) -> Result<String> {
-    let expr = expr.trim();
+fn classify_template_expr(expr: &str) -> TemplateSegment {
     match expr {
-        "vu.id" => Ok(ctx.id.to_string()),
-        "scenario.id" => Ok(ctx.scenario_id.clone()),
-        "step.id" => Ok(step_id.to_string()),
-        "iteration" => Ok(ctx.iteration.to_string()),
-        "uuid" => Ok(Uuid::new_v4().to_string()),
-        "random.u64" => Ok(rand::rng().random::<u64>().to_string()),
-        _ if expr.starts_with("random.int:") => {
-            let mut parts = expr.split(':');
-            let _ = parts.next();
-            let min = parts
-                .next()
-                .ok_or_else(|| Error::config("random.int requires min"))?
-                .parse::<i64>()
-                .map_err(|e| Error::config(format!("invalid random.int min: {e}")))?;
-            let max = parts
-                .next()
-                .ok_or_else(|| Error::config("random.int requires max"))?
-                .parse::<i64>()
-                .map_err(|e| Error::config(format!("invalid random.int max: {e}")))?;
-            if min > max {
-                return Err(Error::config("random.int min must be <= max"));
-            }
-            Ok(rand::rng().random_range(min..=max).to_string())
-        }
-        _ if expr.starts_with("data.") => {
-            let (source_id, path) = parse_data_expr(expr)?;
-            let row = ctx.get_data(source_id).ok_or_else(|| {
-                Error::validation(format!(
-                    "Missing data source row '{source_id}' for template expression '{expr}'"
-                ))
-            })?;
-            let value = extract_relative_json_path(row, path).ok_or_else(|| {
-                Error::validation(format!(
-                    "Missing data path '{path}' in source '{source_id}' for template expression '{expr}'"
-                ))
-            })?;
-            Ok(value_to_template_string(&value))
-        }
-        _ => ctx
-            .get_var(expr)
-            .map(value_to_template_string)
-            .ok_or_else(|| Error::validation(format!("Missing template variable '{expr}'"))),
+        "vu.id" => TemplateSegment::VuId,
+        "scenario.id" => TemplateSegment::ScenarioId,
+        "step.id" => TemplateSegment::StepId,
+        "iteration" => TemplateSegment::Iteration,
+        "uuid" => TemplateSegment::Uuid,
+        "random.u64" => TemplateSegment::RandomU64,
+        _ => TemplateSegment::Expression(expr.to_string()),
     }
+}
+
+fn write_template_segment(
+    out: &mut String,
+    ctx: &VuContext,
+    step_id: &str,
+    segment: &TemplateSegment,
+) -> Result<()> {
+    match segment {
+        TemplateSegment::Literal(text) => out.push_str(text),
+        TemplateSegment::VuId => {
+            let _ = write!(out, "{}", ctx.id);
+        }
+        TemplateSegment::ScenarioId => out.push_str(&ctx.scenario_id),
+        TemplateSegment::StepId => out.push_str(step_id),
+        TemplateSegment::Iteration => {
+            let _ = write!(out, "{}", ctx.iteration);
+        }
+        TemplateSegment::Uuid => out.push_str(&Uuid::new_v4().to_string()),
+        TemplateSegment::RandomU64 => {
+            let _ = write!(out, "{}", rand::rng().random::<u64>());
+        }
+        TemplateSegment::Expression(expr) => out.push_str(&eval_template_expression(ctx, expr)?),
+    }
+    Ok(())
+}
+
+fn resolve_template_expr(ctx: &VuContext, step_id: &str, expr: &str) -> Result<String> {
+    let segment = classify_template_expr(expr.trim());
+    let mut out = String::new();
+    write_template_segment(&mut out, ctx, step_id, &segment)?;
+    Ok(out)
+}
+
+fn eval_template_expression(ctx: &VuContext, expr: &str) -> Result<String> {
+    if let Some(rest) = expr.strip_prefix("random.int:") {
+        let mut parts = rest.split(':');
+        let min = parts
+            .next()
+            .ok_or_else(|| Error::config("random.int requires min"))?
+            .parse::<i64>()
+            .map_err(|e| Error::config(format!("invalid random.int min: {e}")))?;
+        let max = parts
+            .next()
+            .ok_or_else(|| Error::config("random.int requires max"))?
+            .parse::<i64>()
+            .map_err(|e| Error::config(format!("invalid random.int max: {e}")))?;
+        if min > max {
+            return Err(Error::config("random.int min must be <= max"));
+        }
+        return Ok(rand::rng().random_range(min..=max).to_string());
+    }
+    if expr.starts_with("data.") {
+        let (source_id, path) = parse_data_expr(expr)?;
+        let row = ctx.get_data(source_id).ok_or_else(|| {
+            Error::validation(format!(
+                "Missing data source row '{source_id}' for template expression '{expr}'"
+            ))
+        })?;
+        let value = extract_relative_json_path(row, path).ok_or_else(|| {
+            Error::validation(format!(
+                "Missing data path '{path}' in source '{source_id}' for template expression '{expr}'"
+            ))
+        })?;
+        return Ok(value_to_template_string(&value));
+    }
+    ctx.get_var(expr)
+        .map(value_to_template_string)
+        .ok_or_else(|| Error::validation(format!("Missing template variable '{expr}'")))
 }
 
 fn parse_data_expr(expr: &str) -> Result<(&str, &str)> {
@@ -415,6 +449,12 @@ fn parse_data_expr(expr: &str) -> Result<(&str, &str)> {
 #[doc(hidden)]
 pub enum TemplateSegment {
     Literal(String),
+    VuId,
+    ScenarioId,
+    StepId,
+    Iteration,
+    Uuid,
+    RandomU64,
     Expression(String),
 }
 
@@ -434,7 +474,8 @@ pub fn parse_template(template: &str) -> Result<Vec<TemplateSegment>> {
         if expr.is_empty() {
             return Err(Error::config("Empty template expression"));
         }
-        parsed.push(TemplateSegment::Expression(expr.to_string()));
+
+        parsed.push(classify_template_expr(expr));
         rest = &after_start[end + 2..];
     }
     if rest.contains("}}") {
@@ -469,12 +510,7 @@ pub fn render_template(ctx: &VuContext, step_id: &str, template: &str) -> Result
 
     let mut rendered = String::with_capacity(template.len());
     for segment in segments.iter() {
-        match segment {
-            TemplateSegment::Literal(text) => rendered.push_str(text),
-            TemplateSegment::Expression(expr) => {
-                rendered.push_str(&resolve_template_expr(ctx, step_id, expr)?);
-            }
-        }
+        write_template_segment(&mut rendered, ctx, step_id, segment)?;
     }
     Ok(rendered)
 }
@@ -2208,6 +2244,105 @@ mod tests {
     use crate::http::{Request, Response};
     use crate::scenario::{Scenario, ScenarioBuilder, StepBuilder};
     use async_trait::async_trait;
+
+    #[test]
+    fn test_parse_template_classifies_builtins() {
+        let segments = parse_template("{{vu.id}}/{{scenario.id}}/{{step.id}}").unwrap();
+        assert!(matches!(
+            segments.as_slice(),
+            [
+                TemplateSegment::VuId,
+                TemplateSegment::Literal(sep1),
+                TemplateSegment::ScenarioId,
+                TemplateSegment::Literal(sep2),
+                TemplateSegment::StepId,
+            ] if sep1 == "/" && sep2 == "/"
+        ));
+
+        let padded = parse_template("{{ vu.id }}").unwrap();
+        assert!(matches!(padded.as_slice(), [TemplateSegment::VuId]));
+
+        let slow = parse_template("{{random.int:1:2}} {{data.users.name}} {{token}}").unwrap();
+        assert!(matches!(
+            &slow[0],
+            TemplateSegment::Expression(expr) if expr == "random.int:1:2"
+        ));
+        assert!(matches!(
+            &slow[2],
+            TemplateSegment::Expression(expr) if expr == "data.users.name"
+        ));
+        assert!(matches!(
+            &slow[4],
+            TemplateSegment::Expression(expr) if expr == "token"
+        ));
+    }
+
+    #[test]
+    fn test_render_template_builtins_and_slow_path() {
+        let mut ctx = VuContext::new(7, "scen".to_string());
+        ctx.iteration = 3;
+        ctx.insert_var("token", serde_json::json!("abc"));
+        let mut rows = HashMap::new();
+        rows.insert(
+            "users".to_string(),
+            Arc::new(serde_json::json!({"name": "Ada"})),
+        );
+        ctx.set_data_rows(rows);
+
+        assert_eq!(render_template(&ctx, "stepA", "{{vu.id}}").unwrap(), "7");
+        assert_eq!(render_template(&ctx, "stepA", "{{ vu.id }}").unwrap(), "7");
+        assert_eq!(
+            render_template(&ctx, "stepA", "{{scenario.id}}").unwrap(),
+            "scen"
+        );
+        assert_eq!(
+            render_template(&ctx, "stepA", "{{step.id}}").unwrap(),
+            "stepA"
+        );
+        assert_eq!(
+            render_template(&ctx, "stepA", "{{iteration}}").unwrap(),
+            "3"
+        );
+        assert_eq!(
+            render_template(
+                &ctx,
+                "stepA",
+                "{{vu.id}}/{{scenario.id}}/{{step.id}}/{{iteration}}"
+            )
+            .unwrap(),
+            "7/scen/stepA/3"
+        );
+        assert_eq!(
+            render_template(&ctx, "stepA", "{{random.int:4:4}}").unwrap(),
+            "4"
+        );
+        assert_eq!(
+            render_template(&ctx, "stepA", "{{data.users.name}}").unwrap(),
+            "Ada"
+        );
+        assert_eq!(render_template(&ctx, "stepA", "{{token}}").unwrap(), "abc");
+
+        let first_uuid = render_template(&ctx, "stepA", "{{uuid}}").unwrap();
+        let second_uuid = render_template(&ctx, "stepA", "{{uuid}}").unwrap();
+        assert_ne!(first_uuid, second_uuid, "uuid values must not be cached");
+        assert!(Uuid::parse_str(&first_uuid).is_ok());
+
+        let first_rand = render_template(&ctx, "stepA", "{{random.u64}}").unwrap();
+        first_rand.parse::<u64>().unwrap();
+        let mut saw_difference =
+            first_rand != render_template(&ctx, "stepA", "{{random.u64}}").unwrap();
+        for _ in 0..8 {
+            if saw_difference {
+                break;
+            }
+            saw_difference =
+                first_rand != render_template(&ctx, "stepA", "{{random.u64}}").unwrap();
+        }
+        assert!(
+            saw_difference,
+            "random.u64 values must not be cached across renders"
+        );
+    }
 
     /// HTTP client that always fails, so every step exhausts its retries.
     struct FailingHttpClient;
