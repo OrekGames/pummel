@@ -269,7 +269,7 @@ jobs:
       - name: Authenticate to crates.io via Trusted Publishing
         id: crates
         continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@f14f407dad32919804d8e0550a5e471a82249cee # v1
+        uses: rust-lang/crates-io-auth-action@82864bf380abd3e242c564a5ba58dd29d6265b00 # v1
       - name: Publish to crates.io (Trusted Publishing)
         if: steps.crates.outcome == 'success'
         env:
