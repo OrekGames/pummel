@@ -2742,7 +2742,8 @@ steps:
         "#,
             tmp_path
         );
-        let config = Config::from_toml_str(&toml_str).unwrap();
+        let mut config = Config::from_toml_str(&toml_str).unwrap();
+        config.set_source_dir(tmp_file.path().parent().unwrap());
         let report = config.dynamic_lint_report().unwrap();
         assert_eq!(report.data_sources, 1);
         assert_eq!(report.dynamic_steps, 2);

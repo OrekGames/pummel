@@ -302,20 +302,36 @@ pub(crate) fn validate_data_source_id(id: &str) -> Result<()> {
 }
 
 fn load_rows(id: &str, source: &DataSource, base_dir: &Path) -> Result<Vec<Value>> {
-    let path = resolve_source_path(base_dir, &source.path);
+    let path = resolve_source_path(id, base_dir, &source.path)?;
     match source.kind {
         DataSourceKind::Csv => load_csv_rows(id, source, &path),
         DataSourceKind::Json => load_json_rows(id, source, &path),
     }
 }
 
-fn resolve_source_path(base_dir: &Path, path: &str) -> PathBuf {
+fn resolve_source_path(id: &str, base_dir: &Path, path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
-    if path.is_absolute() {
+    let resolved = if path.is_absolute() {
         path.to_path_buf()
     } else {
         base_dir.join(path)
+    };
+
+    let canonical_base = base_dir
+        .canonicalize()
+        .unwrap_or_else(|_| base_dir.to_path_buf());
+    let canonical_resolved = resolved.canonicalize().map_err(|e| {
+        Error::config(format!(
+            "failed to canonicalize data source '{}' path: {}",
+            id, e
+        ))
+    })?;
+    if !canonical_resolved.starts_with(&canonical_base) {
+        return Err(Error::config(format!(
+            "data source '{id}' path is outside the configuration directory"
+        )));
     }
+    Ok(canonical_resolved)
 }
 
 fn load_csv_rows(id: &str, source: &DataSource, path: &Path) -> Result<Vec<Value>> {
