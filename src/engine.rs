@@ -380,7 +380,11 @@ fn write_template_segment(
         TemplateSegment::Iteration => {
             let _ = write!(out, "{}", ctx.iteration);
         }
-        TemplateSegment::Uuid => out.push_str(&Uuid::new_v4().to_string()),
+        TemplateSegment::Uuid => {
+            // OPTIMIZATION: Use a stack-allocated buffer to avoid unnecessary string allocations
+            let mut buf = Uuid::encode_buffer();
+            out.push_str(Uuid::new_v4().hyphenated().encode_lower(&mut buf));
+        }
         TemplateSegment::RandomU64 => {
             let _ = write!(out, "{}", rand::rng().random::<u64>());
         }
