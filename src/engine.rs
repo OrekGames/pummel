@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -372,17 +371,18 @@ fn write_template_segment(
 ) -> Result<()> {
     match segment {
         TemplateSegment::Literal(text) => out.push_str(text),
-        TemplateSegment::VuId => {
-            let _ = write!(out, "{}", ctx.id);
-        }
+        // ⚡ Bolt Optimization: Replace `write!` with `itoa::Buffer` to avoid `std::fmt` overhead when formatting integers.
+        TemplateSegment::VuId => out.push_str(itoa::Buffer::new().format(ctx.id)),
         TemplateSegment::ScenarioId => out.push_str(&ctx.scenario_id),
         TemplateSegment::StepId => out.push_str(step_id),
-        TemplateSegment::Iteration => {
-            let _ = write!(out, "{}", ctx.iteration);
+        TemplateSegment::Iteration => out.push_str(itoa::Buffer::new().format(ctx.iteration)),
+        TemplateSegment::Uuid => {
+            // ⚡ Bolt Optimization: Encode UUID into a stack-allocated buffer to eliminate `to_string()` heap allocation.
+            let mut buf = Uuid::encode_buffer();
+            out.push_str(Uuid::new_v4().hyphenated().encode_lower(&mut buf));
         }
-        TemplateSegment::Uuid => out.push_str(&Uuid::new_v4().to_string()),
         TemplateSegment::RandomU64 => {
-            let _ = write!(out, "{}", rand::rng().random::<u64>());
+            out.push_str(itoa::Buffer::new().format(rand::rng().random::<u64>()));
         }
         TemplateSegment::Expression(expr) => out.push_str(&eval_template_expression(ctx, expr)?),
     }
