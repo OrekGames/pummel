@@ -2706,7 +2706,6 @@ steps:
 
         let mut tmp_file = NamedTempFile::new().unwrap();
         writeln!(tmp_file, "id,name\n1,Alice").unwrap();
-        let tmp_path = tmp_file.path().to_str().unwrap().replace('\\', "/");
 
         let toml_str = format!(
             r#"
@@ -2740,9 +2739,10 @@ steps:
             variable = "token"
             condition = "exists"
         "#,
-            tmp_path
+            tmp_file.path().file_name().unwrap().to_str().unwrap()
         );
-        let config = Config::from_toml_str(&toml_str).unwrap();
+        let mut config = Config::from_toml_str(&toml_str).unwrap();
+        config.source_dir = tmp_file.path().parent().map(|p| p.to_path_buf());
         let report = config.dynamic_lint_report().unwrap();
         assert_eq!(report.data_sources, 1);
         assert_eq!(report.dynamic_steps, 2);
